@@ -1,0 +1,38 @@
+#cloud-config
+package_update: false
+write_files:
+  - path: /opt/dai/real_expert_probe.py
+    permissions: '0755'
+    encoding: gz+b64
+    content: ${real_expert_probe_gz_b64}
+%{ if role == "coordinator" ~}
+  - path: /opt/dai/full_model_remote_expert.py
+    permissions: '0755'
+    encoding: gz+b64
+    content: ${full_model_remote_expert_gz_b64}
+  - path: /opt/dai/full_model_multi_worker_eval.py
+    permissions: '0755'
+    encoding: gz+b64
+    content: ${full_model_multi_worker_eval_gz_b64}
+%{ endif ~}
+%{ if role == "worker" ~}
+  - path: /etc/systemd/system/dai-real-expert.service
+    permissions: '0644'
+    encoding: b64
+    content: ${worker_unit_b64}
+%{ endif ~}
+runcmd:
+  - [ systemd-run, "--unit=dai-ttl-terminate", "--on-active=${ttl_minutes}m", /usr/sbin/shutdown, -h, now ]
+  - [ dnf, install, -y, python3-pip ]
+  - [ python3, -m, venv, /opt/dai/venv ]
+  - [ /opt/dai/venv/bin/pip, install, "--index-url=https://download.pytorch.org/whl/cpu", "torch==2.2.2" ]
+  - [ /opt/dai/venv/bin/pip, install, "transformers==4.51.3", "numpy==1.26.4", "safetensors==0.5.3", "huggingface_hub==0.30.2", "accelerate==1.6.0" ]
+%{ if role == "coordinator" ~}
+  - [ mkdir, -p, /opt/dai/model, /opt/dai/results ]
+  - [ aws, s3, sync, "s3://${model_bucket}/${model_prefix}/", /opt/dai/model/, "--region=${aws_region}", --only-show-errors ]
+%{ else ~}
+  - [ aws, s3, cp, "s3://${model_bucket}/${expert_key}", /opt/dai/expert.safetensors, "--region=${aws_region}", --only-show-errors ]
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, --now, dai-real-expert.service ]
+%{ endif ~}
+  - [ touch, /opt/dai/ready ]

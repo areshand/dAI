@@ -65,3 +65,12 @@ PyTorch 2.2.2 CPU comparison environment.
 concurrently and returns the oracle output to the model. It is the correctness
 mode. `full_model_placement_eval.py` disables duplicate execution and performs
 balanced paired local-only/remote-only forwards. It is the performance mode.
+
+## Multi-worker placement probe
+
+`multi_node_moe.py` connects to exactly two preregistered workers named `near`
+and `far`. It measures the actual persistent RPC path, freezes that discovery
+snapshot, and evaluates hot-near, hot-far, latency-aware, and seeded random
+placements in randomized blocks while verifying identical outputs. The AWS
+runner under `scripts/aws-experiment.sh` exercises this cell on three temporary
+EC2 instances and tears them down after result capture.

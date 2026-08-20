@@ -28,3 +28,7 @@ infra/aws/.terraform/
 infra/aws/*.tfstate
 infra/aws/*.tfstate.*
 infra/aws/run.auto.tfvars.json
+infra/aws-fullmodel/.terraform/
+infra/aws-fullmodel/*.tfstate
+infra/aws-fullmodel/*.tfstate.*
+infra/aws-fullmodel/run.auto.tfvars.json

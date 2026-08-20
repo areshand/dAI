@@ -96,6 +96,25 @@ See the [first three-node AWS experiment](prototype/AWS-EXPERIMENT-2026-08-20.md
 for the measured discovery signal, counterbalanced policy comparison, cleanup
 evidence, and claim boundary.
 
+The real-model follow-up uses a memory-optimized Linux coordinator for the
+pinned BF16 Qwen checkpoint and two identical CPU expert workers. It discovers
+the real expert RPC path and counterbalances local, same-AZ, and cross-AZ
+placements:
+
+```bash
+./scripts/aws-model-cache.sh --upload  # one-time protected seven-day cache
+./scripts/aws-fullmodel-experiment.sh
+```
+
+The full checkpoint is synchronized from a private S3 input cache; only the
+coordinator downloads all shards, while workers download the selected expert
+artifact. The scratchpad cache is separate from ephemeral run output and has a
+seven-day object-expiration policy.
+
+See the [first real full-model AWS experiment](prototype/AWS-FULLMODEL-EXPERIMENT-2026-08-20.md)
+for correctness evidence, decomposed expert timings, counterbalanced forward
+results, and the remaining claim boundary.
+
 ## Repository hygiene
 
 Model checkpoints, extracted weights, tensor outputs, virtual environments,

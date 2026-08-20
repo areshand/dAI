@@ -74,3 +74,11 @@ snapshot, and evaluates hot-near, hot-far, latency-aware, and seeded random
 placements in randomized blocks while verifying identical outputs. The AWS
 runner under `scripts/aws-experiment.sh` exercises this cell on three temporary
 EC2 instances and tears them down after result capture.
+
+`full_model_multi_worker_eval.py` is the real-model successor. It loads the
+complete pinned Qwen checkpoint, preserves the original router, and moves one
+naturally selected expert among the coordinator, a same-AZ worker, and a
+cross-AZ worker. It uses real-expert calls for discovery, randomizes the three
+paths within each block, and checks routes, final logits, and greedy token
+against the local reference. `scripts/aws-fullmodel-experiment.sh` provisions
+and destroys the corresponding Linux cell.

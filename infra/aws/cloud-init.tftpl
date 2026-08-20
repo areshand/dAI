@@ -1,0 +1,24 @@
+#cloud-config
+package_update: false
+write_files:
+  - path: /opt/dai/two_node_moe.py
+    permissions: '0755'
+    encoding: gz+b64
+    content: ${two_node_moe_gz_b64}
+  - path: /opt/dai/multi_node_moe.py
+    permissions: '0755'
+    encoding: gz+b64
+    content: ${multi_node_moe_gz_b64}
+%{ if role == "worker" ~}
+  - path: /etc/systemd/system/dai-worker.service
+    permissions: '0644'
+    encoding: b64
+    content: ${worker_unit_b64}
+%{ endif ~}
+runcmd:
+  - [ mkdir, -p, /opt/dai/results ]
+%{ if role == "worker" ~}
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, --now, dai-worker.service ]
+%{ endif ~}
+  - [ systemd-run, "--unit=dai-ttl-terminate", "--on-active=${ttl_minutes}m", /usr/sbin/shutdown, -h, now ]

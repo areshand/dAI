@@ -22,3 +22,9 @@ prototype/results/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# OpenTofu local state and generated run inputs
+infra/aws/.terraform/
+infra/aws/*.tfstate
+infra/aws/*.tfstate.*
+infra/aws/run.auto.tfvars.json

@@ -64,6 +64,38 @@ For the real-expert and full-model workflows, see
 [`prototype/README.md`](prototype/README.md). They require a separately obtained
 Qwen3 checkpoint and locally generated expert artifacts.
 
+## Three-node AWS placement cell
+
+The first cloud cell provisions a coordinator and near worker together in a
+cluster placement group, plus a far worker in another Availability Zone. The
+coordinator freezes application-path probes, derives a latency-aware placement,
+and compares `hot_near`, `hot_far`, `latency_aware`, and seeded `random`
+placements in counterbalanced blocks.
+
+It defaults to the `mi:scratchpad` AWS profile and `us-west-2`:
+
+```bash
+./scripts/aws-status.sh
+./scripts/aws-experiment.sh
+```
+
+The runner always invokes `tofu destroy` on exit and verifies that no live
+run-tagged instance or EBS volume remains. Every instance also has a verified
+systemd TTL timer and EC2's instance-initiated shutdown behavior is set to
+`terminate`, providing cleanup if the local runner disappears. For recovery of
+an interrupted local runner:
+
+```bash
+./scripts/aws-destroy.sh <exact-run-id>
+```
+
+The AWS cell is synthetic transport/placement evidence. It does not inherit
+the full-model correctness claim from the Mac MPS experiment.
+
+See the [first three-node AWS experiment](prototype/AWS-EXPERIMENT-2026-08-20.md)
+for the measured discovery signal, counterbalanced policy comparison, cleanup
+evidence, and claim boundary.
+
 ## Repository hygiene
 
 Model checkpoints, extracted weights, tensor outputs, virtual environments,

@@ -1,0 +1,7 @@
+torch==2.7.1
+transformers==4.51.3
+numpy==1.26.4
+safetensors==0.5.3
+huggingface_hub==0.30.2
+accelerate==1.6.0
+hf_xet==1.6.0

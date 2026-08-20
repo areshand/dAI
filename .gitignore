@@ -1,0 +1,24 @@
+.DS_Store
+.claude/
+.env
+.env.*
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+
+# Downloaded models and generated tensor artifacts
+model-cache/
+prototype/artifacts/
+*.safetensors
+*.incomplete
+
+# Raw runs may contain machine names, private addresses, and absolute paths.
+prototype/results/
+
+# Local editor and test state
+.idea/
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

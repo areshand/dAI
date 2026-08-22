@@ -67,15 +67,24 @@ No speculative variant cleared the correctness gate. The best raw number
 (n-gram, 5.49×) is prompt-favorable and unstable; the requested 10× target
 is not reached even before applying the correctness bar. EAGLE3's failure
 is qualitatively different from n-gram's: it is *stable but wrong* — a
-reproducible divergence, not run noise, matching Thinking Machines'
-documented batch-invariance mechanism
-([thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference)):
+reproducible divergence, not run noise. **This proves only that the
+divergence is deterministic; it does not by itself prove why.** Two
+competing, unresolved hypotheses exist: a compile-path/graph-capture effect
+specific to this run, or Thinking Machines' documented batch-invariance
+mechanism
+([thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference)) —
 matmul/RMSNorm/attention kernels are not batch-invariant, so a batched
-tree-verification step computes different logits than solo decode for the
-same tokens. N-gram's failure is a separate mechanism — its draft length
-varies per run, so its batch shape (and numerics) varies per run too. Two
-distinct root causes, not one bug — four specialists converged on this
-independently.
+tree-verification step *could* compute different logits than solo decode
+for the same tokens. Neither is confirmed as the cause here; isolating them
+is exactly what the planned uncompiled-rerun-plus-logit-diff experiment
+(Stage 1a below) is for. **This correctness failure is not performance
+evidence** — the EAGLE3 run was 1.59× *faster*, just wrong — so it should
+not be read as a second signal reinforcing any performance conclusion (see
+the Cascade discussion below, which is the independent MoE
+verification-*performance* warning). N-gram's failure is a separate
+mechanism — its draft length varies per run, so its batch shape (and
+numerics) varies per run too. Two distinct root causes, not one bug — four
+specialists converged on this independently.
 
 **Measured near/far expert-boundary data** (`AWS-FULLMODEL-EXPERIMENT-2026-08-20.md`,
 real Qwen3-30B-A3B expert-53 calls, `c7i.xlarge` CPU workers, n=20 discovery
@@ -136,8 +145,10 @@ not be:
    [arxiv.org/abs/2211.17192](https://arxiv.org/abs/2211.17192); Chen et al.,
    DeepMind, [arxiv.org/abs/2302.01318](https://arxiv.org/abs/2302.01318), who
    caveat "preserves target distribution *within hardware numerics*").
-   Proven on paper, but **not guaranteed bit-exact** on real non-batch-invariant
-   kernels — exactly what this repo's EAGLE3 run demonstrates.
+   Proven on paper, but **not guaranteed bit-exact** on real kernels that
+   may not be batch-invariant — one candidate (unresolved) explanation for
+   what this repo's EAGLE3 run demonstrates; see the EAGLE3 discussion
+   above.
 3. **Approximate/distributional quality** — Medusa's "typical acceptance"
    ([arxiv.org/abs/2401.10774](https://arxiv.org/abs/2401.10774)), CALM's
    conformal bound ([arxiv.org/abs/2207.07061](https://arxiv.org/abs/2207.07061)).
@@ -149,20 +160,39 @@ not be:
 
 **Async/disaggregated speculative decoding, token-tree verification.** The
 mechanism that lets a *second machine* do useful concurrent work on one
-stream is pipelining: naive synchronous remote drafting adds full RTT to the
-critical path (`t_draft + RTT + t_verify`) and is a net loss unless the
+stream is pipelining: naive synchronous remote drafting pays the full
+serial cost `L_sync = t_draft + RTT + t_verify` and is a net loss unless the
 target is already slow. llama.cpp issue
 [#23982](https://github.com/ggml-org/llama.cpp/issues/23982) (closed,
 unimplemented proposal for a distributed draft/target proxy) states this
 threshold explicitly: "network overhead is <1% of total latency for
-targets slower than ~50 t/s." Genuinely asynchronous pipelining changes the
-critical path to `max(t_draft, RTT + t_verify)` — the one mechanism found
-anywhere in the review where a second machine performs concurrent useful
-work on the *same* stream. Evidence: PicoSpec (2026,
-[arxiv.org/abs/2603.19133](https://arxiv.org/abs/2603.19133)), real WAN,
-Jetson↔A100, 1.13–2.90×, ablation isolating pipelining as the lever — a
-**research prototype**: a 2026 preprint, real-hardware-plus-simulated-network
-hybrid, not merged into any production runtime reviewed here. (arXiv:2511.21669,
+targets slower than ~50 t/s." Genuinely asynchronous pipelining does
+**not** simply replace this with `max(t_draft, RTT+t_verify)` — that is
+only the full-hit case where every drafted token is accepted. PicoSpec's
+own probabilistic model
+([arxiv.org/abs/2603.19133](https://arxiv.org/abs/2603.19133) §3.4, Eq.
+8–9) gives the expected per-round cost, acceptance-aware, as `E[T] = α^γ ·
+max(t_draft, RTT+t_verify) + (1 − α^γ) · (t_draft + RTT + t_verify)`, where
+γ is the drafted-token window and α the (assumed stationary, independent)
+per-token acceptance rate: with probability α^γ every token in the window
+is accepted (a "full hit," amortized at the max(...) rate); otherwise
+(probability 1−α^γ) a rejection forces a flush/resync, paying the full
+synchronous cost. This degrades gracefully — as α→0, E[T] approaches the
+synchronous baseline, never worse — but it is an expectation over many
+rounds under an idealized independent-acceptance model, not the bare
+max(...) figure. **This repo has not logged a compatible α** for the
+standalone Qwen3-0.6B/Qwen3-30B-A3B draft-target pair — its 0.65×
+colocated result reports only aggregate decode throughput, not a per-token
+acceptance rate — so this formula cannot yet be evaluated on this repo's
+own model pair. PicoSpec itself reports 1.13–2.90× speedup across its four
+model/dataset cells (Qwen 0.6B/32B and Llama 1B/70B on GSM8K/HumanEval,
+real WAN, Jetson↔A100) — a **research prototype**, a 2026 preprint, not
+merged into any production runtime reviewed here. Its own Qwen-GSM8K main
+cell ("Ours (Full)," Table 2) reports a **mean TPOT of 148.84ms**
+(T_draft≈97ms, T_verify≈87ms) and **no p95/p99 anywhere in the paper**;
+that cell's mean already exceeds this task's 100ms target on its own, and
+with no tail data reported, it does not establish this task's under-100ms
+tail objective either way. (arXiv:2511.21669,
 "DSD," is discrete-event fleet serving/routing/batching evidence and is
 **not** batch-one async-pipelining latency evidence — it was miscited as
 such in an earlier pass of this synthesis and is removed from this claim.)
@@ -177,18 +207,20 @@ genuine disaggregation**: moving the draft to independent compute/memory
 bandwidth is a structurally different resource condition that could enable
 real overlap a colocated, resource-sharing draft cannot. Judging the async
 direction requires component-level timing (t_draft, t_verify, acceptance
-rate α, measured separately) plus an explicit overlap/queueing model, not an
+rate α, measured separately) plus the acceptance-aware model above, not an
 inference from the colocated number. Token-tree/multi-drafter verification
 on MoE specifically inflates cost: Cascade
 ([arxiv.org/abs/2506.20675](https://arxiv.org/abs/2506.20675)) shows
 tree-draft verification widens the activated-expert union, inflating memory
-traffic 2–3×, up to 1.5× slowdown. Combined with this repo's own EAGLE3
-failure, two independent signals converge negative for tree-verification on
-this fine-grained, no-shared-expert MoE family — a zero-machine
-architectural mismatch, separate from the async question. (A third,
-informal RTX-3090 community benchmark on Qwen3.6-A3B was cited in an
-earlier pass; it is a non-peer-reviewed community report and is treated
-here as non-load-bearing.)
+traffic 2–3×, up to 1.5× slowdown — a performance warning, independent of
+this repo's own EAGLE3 correctness failure (see the EAGLE3 discussion
+above: a *stable-wrong-hash* result is evidence of deterministic
+divergence, not of a performance problem — EAGLE3's raw run was faster,
+just wrong — so it is not combined with Cascade here as a second
+convergent performance signal). This is a zero-machine architectural
+mismatch, separate from the async question. (A third, informal RTX-3090
+community benchmark on Qwen3.6-A3B was cited in an earlier pass; it is a
+non-peer-reviewed community report and is treated here as non-load-bearing.)
 
 **TP/PP/CP/KV/EP for batch-one and MoE.** Tensor parallelism is a
 synchronous collective (all-reduce every layer); at batch=1 the message is
@@ -258,22 +290,37 @@ specifically; this is triangulated, not a claim any cited paper makes.
 **Rejected** as a direction.
 
 **Early exit/cascade/future-token prediction.** Classic draft-model spec
-decoding, n-gram/prompt-lookup, and CLLM/Jacobi decoding
-([arxiv.org/abs/2305.10427](https://arxiv.org/abs/2305.10427),
-[arxiv.org/abs/2403.00835](https://arxiv.org/abs/2403.00835), fixed point ≡
-greedy AR, theorem-proven) are the only families both theorem-exact and
-structurally offloadable as an independent component. EAGLE-family, Medusa,
-both MTP variants, LayerSkip, CALM, and SkipDecode all require live target
-hidden state on every step — architecturally **not offloadable**; CALM's
-calibrated bound is explicitly non-exact and conflicts with this repo's
-bit-exact mandate. DuoDecoding
+decoding, n-gram/prompt-lookup, and training-free Jacobi decoding
+([arxiv.org/abs/2305.10427](https://arxiv.org/abs/2305.10427), fixed point
+≡ greedy AR for that same model, theorem-proven) are the only members of
+this family that are both theorem-exact and structurally offloadable as an
+independent component. CLLM
+([arxiv.org/abs/2403.00835](https://arxiv.org/abs/2403.00835)) is a
+**different guarantee**, not the same bar: it requires fine-tuning/distilling
+the target model to consistently predict its own fixed point, and its own
+abstract claims only "preserving generation quality" — not bit-exact
+identity to the original, un-tuned target. Reclassified here as
+quality-preserving/fine-tuned rather than bit-exact, absent primary
+evidence otherwise. EAGLE-family, Medusa, both MTP variants, LayerSkip,
+CALM, and SkipDecode all require live target hidden state on every step —
+architecturally **not offloadable**; CALM's calibrated bound is explicitly
+non-exact and conflicts with this repo's bit-exact mandate. DuoDecoding
 ([arxiv.org/abs/2503.00784](https://arxiv.org/abs/2503.00784), CPU+GPU same
-box, 2.61×) and a multi-node InfiniBand result
-([arxiv.org/abs/2511.11733](https://arxiv.org/abs/2511.11733), 2.56–2.59×)
-are the only heterogeneous-hardware speedups found for this family, and
-both need per-hop latency within 3–10× local compute to stay workable. No
-primary source quotes p95/p99 for cross-machine spec decoding directly — a
-literature gap, not a result.
+box, 2.61×) is a genuine heterogeneous-hardware speedup for this family,
+needing per-hop latency within 3–10× local compute to stay workable. (A
+separately-numbered paper, [arxiv.org/abs/2511.11733](https://arxiv.org/abs/2511.11733)
+— also a "DSD," distinct from arXiv:2511.21669 discussed above — reports
+2.56–2.59× but is **not** heterogeneous-hardware evidence: its own §3.1
+states every node runs one identical NVIDIA A800 over a 100Gbps InfiniBand
+link, and its node-scaling ablation ("we simulate deployments with two to
+sixteen nodes") is explicitly simulated, not measured on real multi-node
+hardware. Its best-performing variant also relaxes exact target-distribution
+matching for non-key tokens via a softened distribution (τ up to 0.3, its
+own Eq. 8) — an approximate, quality-preserving method that does **not**
+satisfy this repo's exact-hash bar. It is removed from both the
+heterogeneous-hardware and exact-match claims here.) No primary source
+quotes p95/p99 for cross-machine spec decoding directly — a literature
+gap, not a result.
 
 **Heterogeneous Mac/cheap-GPU/CPU networking.** The repo's own Mac
 measurements are **not** a wired baseline: the coordinator reached the
@@ -299,15 +346,23 @@ fully connected topologies" (full-mesh cabling only; ring/bandwidth
 optimization "should come later" per the PR itself), gated to macOS 26.2+
 and Thunderbolt-5 Macs (M3 Ultra/M4 Pro-Max in Apple's own examples). Its
 "order of magnitude lower latency than ring" claim is self-reported with no
-independent benchmark found in this review. Consumer GPU P2P is excluded
-from NVIDIA's own GPUDirect RDMA documentation, which states it is
-"available on both Tesla and Quadro GPUs"
-([docs.nvidia.com/cuda/gpudirect-rdma/](https://docs.nvidia.com/cuda/gpudirect-rdma/)),
-without listing GeForce; cheap consumer-GPU nodes therefore round-trip
-through host RAM. Same-AZ cloud Ethernet is the only measured regime with
-real headroom for near-full-layer remote dispatch (p95 1.330ms/hop);
-cross-AZ (p95 2.250ms/hop) is borderline once the percentile caveat above
-is applied. Maturity: gRPC/NCCL/InfiniBand/EFA are mature but NCCL is
+independent benchmark found in this review. NVIDIA's own GPUDirect RDMA
+documentation states it is "available on both Tesla and Quadro GPUs"
+([docs.nvidia.com/cuda/gpudirect-rdma/](https://docs.nvidia.com/cuda/gpudirect-rdma/))
+without listing GeForce — this shows the officially documented support
+excludes GeForce, but it does not prove every consumer-GPU topology must
+round-trip through host RAM; no primary source in this review measures
+consumer-GPU P2P directly. Same-AZ cloud Ethernet and cross-AZ cloud
+Ethernet both have real per-hop p95 measurements (1.330ms and 2.250ms
+respectively); whether either regime leaves real end-to-end headroom under
+the 100ms target is **not established** — that would require the
+per-token joint measurement described above, not a sum of marginal p95s.
+Nominal arithmetic only: even taking the (invalid) 48-layer sum at face
+value, ≈64ms (same-AZ) would already be a severe regression from the
+16.589ms/token baseline (~4× slower) — well before asking whether it clears
+the looser 100ms cap — and ≈108ms (cross-AZ) would be worse still; no
+end-to-end percentile conclusion follows from this arithmetic without a
+joint model and an actual per-token measurement. Maturity: gRPC/NCCL/InfiniBand/EFA are mature but NCCL is
 NVIDIA-only, with no vendor-agnostic heterogeneous-GPU collective support
 found in this review (HetCCL,
 [arxiv.org/abs/2605.31000](https://arxiv.org/abs/2605.31000), third-party,
@@ -393,24 +448,28 @@ use. **None of the three is currently demonstrated on this repo.**
 **1. Truly async remote draft/verify speculative decoding, genuinely
 pipelined (PicoSpec-style) — the sole credible candidate today.**
 Mechanism: the draft machine computes round i+1 while the target verifies
-round i, converting the critical path from `t_draft + RTT + t_verify` to
-`max(t_draft, RTT + t_verify)` — the only mechanism found anywhere in this
-review where a second machine does real concurrent work on the same
-stream, since disaggregation gives the draft independent compute/memory
-bandwidth a colocated draft cannot access. Feasibility: **Low** — no async
+round i — the only mechanism found anywhere in this review where a second
+machine does real concurrent work on the same stream, since disaggregation
+gives the draft independent compute/memory bandwidth a colocated draft
+cannot access. The expected per-round cost is **acceptance-aware**, not a
+bare max(...) figure — see the async topic note above for PicoSpec's own
+formula and its Qwen-GSM8K cell (148.84ms mean TPOT, already over this
+task's 100ms target, no p95/p99 reported). Feasibility: **Low** — no async
 pipeline or speculative-KV rollback exists in this repo or in any of the
 mature runtimes reviewed; MoE verification-cost inflation (Cascade,
-confirmed) compounds the problem here. The colocated standalone Qwen3-0.6B
-draft's **0.65×** (net slower, sharing the target GPU) is a warning about
-draft/verify overhead, **not** a zero-RTT proxy for, or a hard blocker on,
-disaggregated operation (see the async topic note above). Required before
-this can be ranked with confidence: (a) component-level timing — t_draft,
-t_verify, acceptance rate α measured separately, not inferred from the
-shared-GPU number; (b) an overlap/queueing model comparing predicted
-`max(t_draft, RTT + t_verify)` against the resident baseline. Confidence:
-**Medium** the mechanism is real in general (PicoSpec shows genuine async
-pipelining beating baseline over real WAN on other models); **Low/unknown**
-for this specific model/stack, pending that component-timing study.
+confirmed) compounds the problem here. The colocated standalone
+Qwen3-0.6B draft's **0.65×** (net slower, sharing the target GPU) is a
+warning about draft/verify overhead, **not** a zero-RTT proxy for, or a
+hard blocker on, disaggregated operation (see the async topic note above).
+Required before this can be ranked with confidence — the Direction 1
+pipeline, Stages 1b→1c→1d→4 below: real per-token ITL instrumentation,
+then measured t_draft/t_verify/α for this repo's own draft-target pair
+(not inferred from the shared-GPU aggregate), then the acceptance-aware
+model evaluated at candidate RTTs, before any actual two-node test.
+Confidence: **Medium** the mechanism is real in general (PicoSpec shows
+genuine async pipelining beating baseline over real WAN on other models);
+**Low/unknown** for this specific model/stack, pending that
+measurement-and-modeling pipeline.
 
 **2. Distributed multi-drafter / token-tree verification — prototype-stage,
 low confidence, likely adverse for this Qwen MoE.** Mechanism: extend
@@ -418,12 +477,18 @@ tree-based multi-candidate verification (SpecInfer/Sequoia/SpecTr-style) to
 genuinely distributed drafters rather than colocated extra GPUs. No source
 found in this review benchmarks that distributed configuration over a
 network — a literature gap, not a settled result. Feasibility: **Low**.
-Evidence specific to this MoE is negative independent of the distribution
-question: Cascade's confirmed 2–3× verification memory-traffic inflation
-for tree-based drafts, and this repo's own EAGLE3 stable-wrong-hash
-failure, both apply zero-machine and both predict token-tree approaches
-will likely underperform on this fine-grained, no-shared-expert MoE
-regardless of how many machines run it. Confidence: **Low**.
+Evidence specific to this MoE is negative on two distinct, non-redundant
+axes, both zero-machine and independent of the distribution question:
+*performance* — Cascade's confirmed 2–3× verification memory-traffic
+inflation for tree-based drafts predicts underperformance from the extra
+compute/memory traffic this MoE's fine-grained, no-shared-expert routing
+creates; and *correctness* — this repo's own EAGLE3 stable-wrong-hash
+failure shows tree verification can deterministically diverge from the
+target on this stack (root cause unresolved — see above), separately from
+whether it would otherwise be fast. The EAGLE3 result is not itself
+performance evidence (that run was 1.59× faster, just wrong) and is not
+combined with Cascade as a second convergent slowdown signal — each is an
+independent reason to deprioritize Direction 2. Confidence: **Low**.
 
 **3. Heterogeneous sharding / offload-and-cache (same-AZ parallel
 multi-expert fetch into concurrent RPCs, or CPU/NVMe offload) — conditional
@@ -465,27 +530,29 @@ for that reason, even though several reviewers rated them individually
 higher-priority than any machine-causal direction:
 
 1. **EAGLE3 stable-wrong-hash root cause** — uncompiled rerun, batch-vs-solo
-   logit diff, to isolate compile-path vs. tree-attention batch-invariance.
-   Four specialists converged on this unprompted; grounded in Thinking
-   Machines' confirmed batch-invariance mechanism. Gates whether
-   tree-verification-family spec-decoding (Direction 2) can ever be a
-   correctness-qualified lever here — kept independent of the remote-expert
-   and standalone-draft tracks below (different mechanisms, different
-   failure modes).
+   logit diff, to isolate compile-path vs. tree-attention batch-invariance —
+   two competing, unresolved hypotheses (see the EAGLE3 discussion above);
+   this stable-wrong-hash result only proves the divergence is
+   deterministic, not why. Four specialists converged on running this
+   isolation experiment unprompted. Gates whether tree-verification-family
+   spec-decoding (Direction 2) can ever be a correctness-qualified lever
+   here — kept independent of the remote-expert and standalone-draft
+   tracks below (different mechanisms, different failure modes).
 2. **Per-token ITL instrumentation** — no code path anywhere in this repo
    produces a real per-token p50/p95/p99 distribution today; the harness
    only reports p95 for trial-level TTFT/total-latency/output-TPS. Every
    per-token p95/p99<100ms claim in this document is unverifiable without
-   this.
+   this. (= Stage 1b below.)
 3. **Genuinely wired (both ends) Mac Ethernet/Thunderbolt baseline** — the
    existing Mac numbers are coordinator-Ethernet-to-worker-Wi-Fi, a mixed
    asymmetric link, not a wired control (`EXPERIMENT-2026-08-20.md`); this
-   repo has not yet run a true wired-both-ends cell.
-4. **Component-level draft/verify timing** — t_draft, t_verify, and
-   acceptance rate α measured separately, colocated (no RTT), for the
-   standalone/classic draft-target mechanism specifically (not EAGLE).
-   Required before Direction 1 (async remote draft/verify) can be judged —
-   see the async-decoding topic note above.
+   repo has not yet run a true wired-both-ends cell. (= Stage 0 below.)
+4. **Measured draft/verify/acceptance traces, then an acceptance-aware
+   overlap model** — t_draft, t_verify, and per-token acceptance rate α for
+   the standalone/classic draft-target mechanism (not EAGLE), measured
+   colocated, then fed into PicoSpec's acceptance-aware cost formula (see
+   the async topic note above) to predict whether Direction 1 is worth an
+   actual two-node test. (= Stages 1c and 1d below.)
 5. **Statistical design** — a pilot run to estimate variance, followed by an
    explicit power calculation for a preregistered minimum-worthwhile-effect
    or equivalence margin, replacing any arbitrary large-n rule before a
@@ -493,28 +560,41 @@ higher-priority than any machine-causal direction:
 
 ## Staged experiment roadmap
 
-Every stage that estimates an effect uses the same design: a preregistered
-paired estimand (end-to-end visible-ITL or throughput difference, e.g.
-"remote-touched minus local-only decode time per token," **sign fixed in
-advance** — positive means remote/async is slower), a preregistered minimum
-worthwhile improvement (or equivalence margin around zero) decided before
-data collection, a small pilot to estimate variance, then an explicit power
-calculation for that margin — not an arbitrary "n≫5" rule. A CI that
-straddles zero **without adequate power is inconclusive, not evidence of
-non-causality**; only a fully-powered CI that falls inside the
-predefined equivalence margin licenses an "equivalent/no meaningful effect"
-conclusion. The EAGLE3 track and the remote-expert/draft-verify tracks are
-kept independent — a failure in one does not stop or gate the others.
+**Estimand and sign convention, fixed once for every stage:** define
+Δ_lat = latency(remote/async) − latency(local), in ms/token (or ms for
+TTFT). Improvement (remote/async faster) means **Δ_lat < 0**. Fix a
+minimum-worthwhile-improvement δ>0 (ms) and an equivalence half-width ε>0
+(ms) *before* collecting data. **Improvement gate**: the CI's *upper*
+bound for Δ_lat is ≤ −δ. **Equivalence gate**: the *entire* CI for Δ_lat
+lies within [−ε, +ε]. A CI that clears neither gate is **inconclusive**
+(not "not causal") — collect more data per the power calculation. Where a
+stage's natural metric is throughput instead, define Δ_thr =
+throughput(remote/async) − throughput(local), tok/s, with the **opposite**
+sign logic: improvement means Δ_thr > 0 (CI *lower* bound ≥ +δ_thr);
+equivalence means the entire CI lies within [−ε_thr, +ε_thr]. Every stage
+below states which estimand it uses. All use a small pilot to estimate
+variance, then an explicit power calculation for the preregistered margin —
+not an arbitrary "n≫5" rule. "Machines" below counts **added** machines
+relative to the single-GPU baseline that already exists.
 
-| Stage | Machines | Content | Go/no-go gate |
+**Direction 1's own pipeline** (the only prerequisite chain that gates
+Direction 1) is 1b → 1c → 1d → 4: build instrumentation, measure real
+draft/verify/acceptance traces, build the acceptance-aware model, only
+then run the actual two-node async test. Stage 0 (wired-Mac
+characterization), Stage 1a (EAGLE), and Stage 2 (remote-expert diagnostic)
+are **parallel side tracks** — useful in their own right, but none of them
+gates or is gated by Direction 1.
+
+| Stage | Added machines | Content | Go/no-go gate |
 |---|---|---|---|
-| 0 | 0 | Genuinely wired-both-ends Mac Ethernet/Thunderbolt run (distinct from the existing coordinator-Ethernet/worker-Wi-Fi data); confirm real `top_k`/experts-per-layer from `config.json`. | None — always run. |
-| 1a (EAGLE track, independent) | 0 | EAGLE3 uncompiled rerun + batched-vs-solo logit diff. | Exact-hash pass → Direction 2 (tree-verification) is a real lever; fail → deprioritize Direction 2 only. Does not gate Stages 2 or 4. |
-| 1b | 0 | Build real per-token p50/p95/p99 ITL logging into the decode loop. | Must exist before any Stage 2/4 per-token percentile claim is valid. |
-| 1c (draft/verify track, independent of 1a) | 0 (colocated) | Measure t_draft, t_verify, α separately for the standalone/classic draft-target mechanism; build an overlap model predicting `max(t_draft, RTT+t_verify)` vs. the resident baseline. | Informs the RTT budget Stage 4 must beat; a losing colocated number lowers that budget, not a Stage-4 block. |
-| 2 (diagnostic/boundary, independent of 1a) | 1+ | Sparse same-AZ remote-expert, KV-cache authoritative; same 2026-08-22 workload/exact-hash gate; pilot for variance, then power-calculated n; per-token p50/p95/p99. | End-to-end visible-ITL p95/p99 **<100ms**, and paired estimate exceeds the margin (proceed) or falls inside it (declare equivalence) — underpowered zero-crossing means collect more data, not "not causal." |
-| 3 (Direction 3, conditional) | 1+ | Only if a future model/device doesn't fit locally: batch experts/layer into one RPC vs. llama.cpp `--n-cpu-moe`/ktransformers zero-network reference; same framework as Stage 2. | Beats the local-offload baseline by more than the margin; p95/p99 <100ms where a latency SLA applies. |
-| 4 (Direction 1, independent of 1a) | 2+ | Only after Stage 1c predicts a plausible win at the target RTT: run the actual async disaggregated pipeline (not the colocated proxy); same exact-hash gate and estimand/margin/power framework as Stage 2. | End-to-end visible-ITL p95/p99 **<100ms**, and paired estimate exceeds the margin. |
+| 0 (side track) | 1 | Genuinely wired-both-ends Mac Ethernet/Thunderbolt run (distinct from the existing coordinator-Ethernet/worker-Wi-Fi data); confirm real `top_k`/experts-per-layer from `config.json`. | None — always run. |
+| 1a (EAGLE side track) | 0 | EAGLE3 uncompiled rerun + batched-vs-solo logit diff. | Exact-hash pass → Direction 2 (tree-verification) is a real lever; fail → deprioritize Direction 2 only. Does not gate Direction 1 or Stage 2. |
+| 1b (Direction 1, step 1) | 0 | Build real per-token p50/p95/p99 ITL logging into the decode loop. | Must exist before any per-token percentile claim at Stage 2 or 4 is valid. |
+| 1c (Direction 1, step 2) | 0 (colocated) | Measure t_draft, t_verify, and per-token acceptance rate α separately for the standalone/classic draft-target mechanism (real traces, not assumed). | Feeds Stage 1d; a losing colocated aggregate number does not by itself block the pipeline (see the async topic note on why colocated ≠ disaggregated). |
+| 1d (Direction 1, step 3 — modeling only) | 0 | Using 1c's measured t_draft, t_verify, α and the acceptance-aware formula (`E[T] = α^γ·max(t_draft,RTT+t_verify) + (1−α^γ)·(t_draft+RTT+t_verify)`), compute predicted E[T] across candidate RTTs and compare to the resident single-GPU baseline. | Predicted Δ_lat's sign and magnitude at the target RTT set the δ Stage 4 must clear; if no candidate RTT predicts Δ_lat < 0, that is informative and Stage 4 should not proceed yet. |
+| 2 (diagnostic/boundary side track) | 1 | Sparse same-AZ remote-expert, KV-cache authoritative; same 2026-08-22 workload/exact-hash gate; pilot for variance, then power-calculated n; per-token p50/p95/p99. Estimand: Δ_lat. | End-to-end visible-ITL p95/p99 **<100ms**, and Δ_lat's CI upper bound ≤ −δ (declare improvement, informs Direction 3) or entire CI within [−ε,+ε] (declare equivalence) — a CI clearing neither means collect more data, not "not causal." |
+| 3 (Direction 3, conditional) | 1+ | Only if a future model/device doesn't fit locally: batch experts/layer into one RPC vs. llama.cpp `--n-cpu-moe`/ktransformers zero-network reference. States up front whether it uses Δ_lat or Δ_thr; same gate logic as Stage 2 with that estimand's sign. | Clears the improvement gate for its declared estimand; end-to-end p95/p99 <100ms where a latency SLA applies. |
+| 4 (Direction 1, step 4) | 1 | Only after Stage 1d predicts a plausible win at the target RTT: run the actual async disaggregated pipeline (not the colocated proxy), same exact-hash gate. Estimand: Δ_lat. | End-to-end visible-ITL p95/p99 **<100ms**, and Δ_lat's CI upper bound ≤ −δ. |
 
 **Correctness definition carried through every stage**: exact full-sequence
 output-hash equality against the single-machine reference, one output hash
@@ -537,16 +617,17 @@ offload reference for Stage 3, so any measured number has a same-hardware,
 zero-network comparison point rather than only a cross-machine one.
 
 **Stopping criteria**: (a) Stage 1a failing stops/deprioritizes Direction 2
-(tree-verification spec-decoding) specifically — it does **not** stop Stage
-2 or Stage 4, which test different mechanisms and have their own
-correctness gates. (b) For any stage, if the pilot-informed power
-calculation shows the study cannot yet distinguish the preregistered
-minimum-worthwhile effect from zero, the correct action is to collect more
-data per that calculation — not to declare "added machines are not
-causal." Declare "no meaningful effect" only when a fully-powered CI falls
-inside the predefined equivalence margin. (c) Any stage whose end-to-end
-visible-ITL p95/p99 exceeds 100ms disqualifies that regime outright,
-replacing any flat per-hop threshold.
+(tree-verification spec-decoding) specifically — it does **not** stop the
+Direction 1 pipeline (1b→1c→1d→4) or Stage 2, which test different
+mechanisms and have their own correctness gates. (b) For any stage, if the
+pilot-informed power calculation shows the study cannot yet distinguish the
+preregistered minimum-worthwhile effect from zero (i.e. clears neither the
+improvement nor the equivalence gate above), the correct action is to
+collect more data per that calculation — not to declare "added machines
+are not causal." Declare "no meaningful effect" only when a fully-powered
+CI falls inside the predefined equivalence margin. (c) Any stage whose
+end-to-end visible-ITL p95/p99 exceeds 100ms disqualifies that regime
+outright, replacing any flat per-hop threshold.
 
 ## Self-review
 
@@ -590,3 +671,28 @@ reframed from "hard blocker" to "warning requiring component timing"; the
 invalid 0.95⁴⁸ argument was removed; and roadmap gates now use
 preregistered estimands, equivalence margins, and power calculations
 instead of a flat n≫5 rule or an arbitrary per-hop percentage.
+
+**Verifier iteration-2 corrections applied**, each re-verified directly
+(PicoSpec's full PDF read via `Read`; arXiv:2511.11733's title confirmed
+via search and its full PDF read via `Read` to disambiguate it from
+arXiv:2511.21669, whose own title/abstract were re-confirmed via search;
+CLLM's abstract fetched): the async-decoding cost model is now acceptance-aware
+(PicoSpec Eq. 8–9), not a bare max(...), with PicoSpec's own Qwen-GSM8K
+148.84ms-mean-TPOT/no-p95-p99 cell disclosed; the estimand sign is now
+fixed and unambiguous (Δ_lat/Δ_thr, opposite-sign conventions, explicit
+improvement/equivalence gates) across Stages 2–4; the percentile section no
+longer claims real end-to-end headroom or cross-AZ "borderline feasibility"
+from summed marginal p95s, stating only nominal arithmetic and the implied
+regression from baseline; arXiv:2511.11733 is reclassified as homogeneous-hardware
+(A800/100Gbps InfiniBand, per its own §3.1), simulated node-scaling, and
+relaxed (non-exact) verification — not heterogeneous or exact-hash
+evidence; CLLM is reclassified as quality-preserving/fine-tuned, not
+bit-exact to the original target; EAGLE3's stable-wrong-hash result is now
+treated as proof of deterministic divergence only (compile-path vs.
+batch-invariance left as competing unresolved hypotheses) and is no longer
+combined with Cascade as convergent performance evidence; the GeForce/GPUDirect
+sentence no longer claims every consumer topology must round-trip through
+host RAM; and the roadmap now states explicitly that only Stages
+1b→1c→1d→4 gate Direction 1, with Stage 0/1a/2 as parallel side tracks, and
+labels the "Machines" column as machines added beyond the existing
+single-GPU baseline.

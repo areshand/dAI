@@ -81,10 +81,17 @@ is exactly what the planned uncompiled-rerun-plus-logit-diff experiment
 evidence** — the EAGLE3 run was 1.59× *faster*, just wrong — so it should
 not be read as a second signal reinforcing any performance conclusion (see
 the Cascade discussion below, which is the independent MoE
-verification-*performance* warning). N-gram's failure is a separate
-mechanism — its draft length varies per run, so its batch shape (and
-numerics) varies per run too. Two distinct root causes, not one bug — four
-specialists converged on this independently.
+verification-*performance* warning). N-gram's failure looks like a
+**separate failure signature**: it is unstable (2 hashes across 10 runs)
+rather than stable-but-wrong, and a plausible, unisolated hypothesis is
+that its draft length varies per run, varying its batch shape (and
+numerics) run to run — but this, like the EAGLE3 hypotheses above, has not
+been isolated by any experiment run so far. **Two distinct failure
+signatures, not one bug** — stable-wrong-hash vs. unstable-hash — four
+specialists converged on treating these as separate unprompted, but
+neither proposed cause (n-gram's batch-shape hypothesis, nor EAGLE3's
+compile-path/batch-invariance hypotheses) has actually been isolated by an
+experiment.
 
 **Measured near/far expert-boundary data** (`AWS-FULLMODEL-EXPERIMENT-2026-08-20.md`,
 real Qwen3-30B-A3B expert-53 calls, `c7i.xlarge` CPU workers, n=20 discovery
@@ -107,15 +114,20 @@ placement, and not yet evidence for it either.
 
 The harness computes trial-level **p95 for TTFT, total (end-to-end)
 latency, and output tokens/s** where it reports percentiles at all (e.g.
-the AWS discovery probe's p50/p95 over n=20 calls). But **no experiment in
-this repo has ever produced a per-token inter-token-latency (ITL)
-distribution**, and **no p99 exists anywhere** — only p50/p95 (discovery
-probe, n=20) or mean/median (whole-forward table, n=5).
-`full_model_multi_worker_eval.py` runs with `use_cache=False` (prefill-only,
-no decode loop); `full_model_shadow_eval.py` keeps its remote path
-shadow-only, never authoritative for the actual output. No code path in
-this repo produces the per-token number a `p95/p99 < 100ms` claim would
-require. Any such claim made about any candidate below is currently
+the AWS discovery probe's p50/p95 over n=20 calls). The precise gap is
+narrower than "no percentiles anywhere": **`two_node_moe.py` itself
+computes p50/p95/p99** on its measured round-trip values, and the retained
+raw boundary/microbenchmark JSON results contain p99 figures — but these
+are RPC-hop and whole-forward measurements, not the thing this task
+actually needs. **No end-to-end, client-visible, per-token inter-token-latency
+(ITL) p99 exists for the real Qwen generation/decode experiments** —
+`full_model_multi_worker_eval.py` runs with `use_cache=False`
+(prefill-only, no decode loop); `full_model_shadow_eval.py` keeps its
+remote path shadow-only, never authoritative for the actual output; and
+the AWS-GENERATION-EXPERIMENT-2026-08-22.md speculative-decoding trial
+table reports only medians. No code path in this repo produces the
+per-token, client-visible number a `p95/p99 < 100ms` claim would require.
+Any such claim made about any candidate below is currently
 **unverifiable**, not merely unproven.
 
 One specialist (hetero-net) computed: "same-AZ p95=1.330ms × 48 layers ≈
@@ -168,31 +180,52 @@ unimplemented proposal for a distributed draft/target proxy) states this
 threshold explicitly: "network overhead is <1% of total latency for
 targets slower than ~50 t/s." Genuinely asynchronous pipelining does
 **not** simply replace this with `max(t_draft, RTT+t_verify)` — that is
-only the full-hit case where every drafted token is accepted. PicoSpec's
-own probabilistic model
-([arxiv.org/abs/2603.19133](https://arxiv.org/abs/2603.19133) §3.4, Eq.
-8–9) gives the expected per-round cost, acceptance-aware, as `E[T] = α^γ ·
-max(t_draft, RTT+t_verify) + (1 − α^γ) · (t_draft + RTT + t_verify)`, where
-γ is the drafted-token window and α the (assumed stationary, independent)
-per-token acceptance rate: with probability α^γ every token in the window
-is accepted (a "full hit," amortized at the max(...) rate); otherwise
-(probability 1−α^γ) a rejection forces a flush/resync, paying the full
-synchronous cost. This degrades gracefully — as α→0, E[T] approaches the
-synchronous baseline, never worse — but it is an expectation over many
-rounds under an idealized independent-acceptance model, not the bare
-max(...) figure. **This repo has not logged a compatible α** for the
-standalone Qwen3-0.6B/Qwen3-30B-A3B draft-target pair — its 0.65×
-colocated result reports only aggregate decode throughput, not a per-token
-acceptance rate — so this formula cannot yet be evaluated on this repo's
-own model pair. PicoSpec itself reports 1.13–2.90× speedup across its four
-model/dataset cells (Qwen 0.6B/32B and Llama 1B/70B on GSM8K/HumanEval,
-real WAN, Jetson↔A100) — a **research prototype**, a 2026 preprint, not
-merged into any production runtime reviewed here. Its own Qwen-GSM8K main
-cell ("Ours (Full)," Table 2) reports a **mean TPOT of 148.84ms**
-(T_draft≈97ms, T_verify≈87ms) and **no p95/p99 anywhere in the paper**;
-that cell's mean already exceeds this task's 100ms target on its own, and
-with no tail data reported, it does not establish this task's under-100ms
-tail objective either way. (arXiv:2511.21669,
+only the full-hit case where every drafted token is accepted, and even
+then it is a **per-cycle** time, not a per-token one. PicoSpec's own
+probabilistic model
+([arxiv.org/abs/2603.19133](https://arxiv.org/abs/2603.19133) §3.4, Eq. 5,
+8–9) gives the expected cost **per speculative cycle** as `E[T_async] =
+α^γ · max(t_draft, RTT+t_verify) + (1 − α^γ) · (t_draft + RTT + t_verify)`,
+where γ is the drafted-token window and α the (assumed stationary,
+independent) per-token acceptance rate: with probability α^γ every token
+in the window is accepted (a "full hit," amortized at the max(...) rate);
+otherwise (probability 1−α^γ) a rejection forces a flush/resync, paying
+the full synchronous cost. A cycle does not produce a fixed number of
+tokens: the expected tokens per cycle is `E[L] = (1 − α^γ)/(1 − α)` (at
+α=1, by the limit, E[L]=γ; as α→0, E[L]→1). **The per-token time is
+therefore E[T_async]/E[L], not E[T_async] itself** — comparing raw
+E[T_async] to this repo's 16.589ms/token resident baseline would be a
+units error; the correct comparison is throughput = E[L]/E[T_async], or
+equivalently ms/token = E[T_async]/E[L], against 16.589ms/token. This
+degrades gracefully — as α→0, E[T_async]→the synchronous cost and E[L]→1,
+so the per-token time also approaches the synchronous per-token cost
+(never worse); as α→1, E[L]→γ and the per-token time approaches
+max(t_draft,RTT+t_verify)/γ, the most favorable case. This is an
+expectation over many cycles under an idealized independent-acceptance
+model, not a single-cycle figure. **This repo has not logged a α/γ trace
+compatible with PicoSpec's formalism**: the retained standalone-draft
+SGLang server log has 32 coarse periodic engine-status records (not
+request/round-aligned PicoSpec traces) reporting accept rate 0.25–0.40
+(mean 0.3353) and accept length 2.00–2.60 tokens (mean 2.3394) for the
+colocated Qwen3-0.6B/Qwen3-30B-A3B pair. These are useful warning/initial
+evidence — a roughly one-in-three token acceptance rate and ~2.3-token
+accepted spans, both modest — but cannot directly parameterize the formula
+without first mapping SGLang's own accept-rate/accept-length runtime
+metrics onto PicoSpec's per-token α and drafted-window γ, and without
+request-level alignment; treat them as directional, not a
+fabricated-precision input. PicoSpec itself reports 1.13–2.90× speedup
+across its four model/dataset cells (Qwen 0.6B/32B and Llama 1B/70B on
+GSM8K/HumanEval, real WAN, Jetson↔A100) — a **research prototype**, a 2026
+preprint, not merged into any production runtime reviewed here. Its own
+Qwen-GSM8K main cell ("Ours (Full)," Table 2) reports **both** a
+throughput of 20.19 tokens/s (≈49.53ms/token by direct conversion) **and**,
+in the same row, a labeled TPOT of 148.84ms — a roughly 3× discrepancy
+between the two figures that the extractable text does not reconcile;
+flagged here as a source inconsistency/metric-definition ambiguity, not
+resolved by this review. No p95/p99 or other client-visible tail is
+disclosed for either figure, so this cell **neither proves nor disproves**
+this task's under-100ms visible-ITL objective — it is inconclusive, not a
+pass or a fail. (arXiv:2511.21669,
 "DSD," is discrete-event fleet serving/routing/batching evidence and is
 **not** batch-one async-pipelining latency evidence — it was miscited as
 such in an earlier pass of this synthesis and is removed from this claim.)
@@ -206,9 +239,12 @@ overhead, but it is **not a zero-RTT proxy for, or a hard blocker on,
 genuine disaggregation**: moving the draft to independent compute/memory
 bandwidth is a structurally different resource condition that could enable
 real overlap a colocated, resource-sharing draft cannot. Judging the async
-direction requires component-level timing (t_draft, t_verify, acceptance
-rate α, measured separately) plus the acceptance-aware model above, not an
-inference from the colocated number. Token-tree/multi-drafter verification
+direction requires t_draft measured **independently on each proposed
+remote hardware class** (Mac, CPU, cheap GPU) — a colocated data-center-GPU
+draft timing is only a control, not a stand-in for remote hardware — plus
+t_verify on the target, RTT and serialization for the pairing, and the
+E[L]-corrected acceptance-aware model above, not an inference from the
+colocated aggregate number. Token-tree/multi-drafter verification
 on MoE specifically inflates cost: Cascade
 ([arxiv.org/abs/2506.20675](https://arxiv.org/abs/2506.20675)) shows
 tree-draft verification widens the activated-expert union, inflating memory
@@ -413,12 +449,14 @@ policy — this is this review's own synthesis.
   values has no justified percentile label for the sum without a stated
   joint/dependence model; the 44/48-layer framing also silently swapped
   the SLA target from 16.6ms/token to 100ms/token.
-- **No per-token ITL distribution exists in this repo today.** The harness
-  reports trial-level p95 for TTFT/total latency/output TPS where it
-  reports percentiles at all; only the RPC-hop discovery probe (n=20, p50/p95,
-  no p99) and the whole-forward table (n=5, mean/median) exist otherwise.
-  Any per-token p95/p99 <100ms claim for any candidate in this document is
-  currently unverifiable.
+- **No end-to-end, client-visible, per-token ITL distribution exists for
+  the real Qwen generation/decode experiments.** `two_node_moe.py` and the
+  retained raw boundary/microbenchmark results do compute/contain p99 —
+  but only for RPC-hop and whole-forward measurements, not the client-visible
+  per-token ITL this task needs; the AWS discovery probe (n=20) has p50/p95
+  only, and the whole-forward table (n=5) has mean/median only. Any
+  per-token, client-visible p95/p99 <100ms claim for any candidate in this
+  document is currently unverifiable.
 - **A CI crossing zero is inconclusive, not proof of non-causality.**
   Without a preregistered minimum-worthwhile-effect margin and a power
   calculation behind it, an underpowered zero-crossing interval licenses
@@ -451,21 +489,29 @@ Mechanism: the draft machine computes round i+1 while the target verifies
 round i — the only mechanism found anywhere in this review where a second
 machine does real concurrent work on the same stream, since disaggregation
 gives the draft independent compute/memory bandwidth a colocated draft
-cannot access. The expected per-round cost is **acceptance-aware**, not a
-bare max(...) figure — see the async topic note above for PicoSpec's own
-formula and its Qwen-GSM8K cell (148.84ms mean TPOT, already over this
-task's 100ms target, no p95/p99 reported). Feasibility: **Low** — no async
-pipeline or speculative-KV rollback exists in this repo or in any of the
-mature runtimes reviewed; MoE verification-cost inflation (Cascade,
-confirmed) compounds the problem here. The colocated standalone
-Qwen3-0.6B draft's **0.65×** (net slower, sharing the target GPU) is a
-warning about draft/verify overhead, **not** a zero-RTT proxy for, or a
-hard blocker on, disaggregated operation (see the async topic note above).
-Required before this can be ranked with confidence — the Direction 1
-pipeline, Stages 1b→1c→1d→4 below: real per-token ITL instrumentation,
-then measured t_draft/t_verify/α for this repo's own draft-target pair
-(not inferred from the shared-GPU aggregate), then the acceptance-aware
-model evaluated at candidate RTTs, before any actual two-node test.
+cannot access. The expected cost per cycle is **acceptance-aware**, not a
+bare max(...) figure, and must be converted from per-cycle to per-token via
+the expected-tokens-per-cycle E[L] before comparing to this repo's
+16.589ms/token baseline — see the async topic note above for PicoSpec's
+own formula and its Qwen-GSM8K cell (a 3× internal discrepancy between its
+labeled 148.84ms TPOT and its 20.19 tok/s throughput figure, and no
+p95/p99 reported either way — inconclusive for this task's 100ms target,
+not a pass or a fail). Feasibility: **Low** — no async pipeline or
+speculative-KV rollback exists in this repo or in any of the mature
+runtimes reviewed; MoE verification-cost inflation (Cascade, confirmed)
+compounds the problem here. The colocated standalone Qwen3-0.6B draft's
+**0.65×** (net slower, sharing the target GPU) is a warning about
+draft/verify overhead, **not** a zero-RTT proxy for, or a hard blocker on,
+disaggregated operation (see the async topic note above); this repo's own
+32-record coarse engine log (accept rate mean 0.3353, accept length mean
+2.3394) is directional warning evidence only, not a PicoSpec-compatible
+α/γ trace. Required before this can be ranked with confidence — the
+Direction 1 pipeline, Stages 1b→1c→1d→4 below: real per-token ITL
+instrumentation, then t_draft measured independently on each proposed
+remote hardware class (not inferred from a colocated control) plus
+t_verify/RTT/serialization and request-aligned α/γ, then the
+acceptance-aware, E[L]-corrected model evaluated at candidate RTTs, before
+any actual two-node test.
 Confidence: **Medium** the mechanism is real in general (PicoSpec shows
 genuine async pipelining beating baseline over real WAN on other models);
 **Low/unknown** for this specific model/stack, pending that
@@ -539,20 +585,26 @@ higher-priority than any machine-causal direction:
    here — kept independent of the remote-expert and standalone-draft
    tracks below (different mechanisms, different failure modes).
 2. **Per-token ITL instrumentation** — no code path anywhere in this repo
-   produces a real per-token p50/p95/p99 distribution today; the harness
-   only reports p95 for trial-level TTFT/total-latency/output-TPS. Every
-   per-token p95/p99<100ms claim in this document is unverifiable without
-   this. (= Stage 1b below.)
+   produces a real end-to-end, client-visible per-token p50/p95/p99
+   distribution today; the harness reports trial-level p95 for
+   TTFT/total-latency/output-TPS, and `two_node_moe.py`/retained raw
+   results do compute p99, but only for RPC-hop/whole-forward
+   measurements, not this. Every per-token p95/p99<100ms claim in this
+   document is unverifiable without this. (= Stage 1b below.)
 3. **Genuinely wired (both ends) Mac Ethernet/Thunderbolt baseline** — the
    existing Mac numbers are coordinator-Ethernet-to-worker-Wi-Fi, a mixed
    asymmetric link, not a wired control (`EXPERIMENT-2026-08-20.md`); this
    repo has not yet run a true wired-both-ends cell. (= Stage 0 below.)
-4. **Measured draft/verify/acceptance traces, then an acceptance-aware
-   overlap model** — t_draft, t_verify, and per-token acceptance rate α for
-   the standalone/classic draft-target mechanism (not EAGLE), measured
-   colocated, then fed into PicoSpec's acceptance-aware cost formula (see
-   the async topic note above) to predict whether Direction 1 is worth an
-   actual two-node test. (= Stages 1c and 1d below.)
+4. **Measured draft/verify/acceptance traces per remote hardware class,
+   then an acceptance-aware overlap model** — t_draft measured
+   independently on each proposed remote class (Mac, CPU, cheap GPU, a
+   colocated data-center-GPU number is only a control), t_verify on the
+   target, RTT/serialization for the pairing, and request-aligned α/γ for
+   the standalone/classic draft-target mechanism (not EAGLE) — then fed
+   into PicoSpec's acceptance-aware cost formula, converted from
+   per-cycle to per-token via E[L] = (1−α^γ)/(1−α) (see the async topic
+   note above), to predict whether Direction 1 is worth an actual
+   two-node test. (= Stages 1c and 1d below.)
 5. **Statistical design** — a pilot run to estimate variance, followed by an
    explicit power calculation for a preregistered minimum-worthwhile-effect
    or equivalence margin, replacing any arbitrary large-n rule before a
@@ -579,8 +631,9 @@ relative to the single-GPU baseline that already exists.
 
 **Direction 1's own pipeline** (the only prerequisite chain that gates
 Direction 1) is 1b → 1c → 1d → 4: build instrumentation, measure real
-draft/verify/acceptance traces, build the acceptance-aware model, only
-then run the actual two-node async test. Stage 0 (wired-Mac
+draft/verify/acceptance traces **per proposed remote hardware class**
+(not just colocated), build the acceptance-aware, per-token-corrected
+model, only then run the actual two-node async test. Stage 0 (wired-Mac
 characterization), Stage 1a (EAGLE), and Stage 2 (remote-expert diagnostic)
 are **parallel side tracks** — useful in their own right, but none of them
 gates or is gated by Direction 1.
@@ -590,8 +643,8 @@ gates or is gated by Direction 1.
 | 0 (side track) | 1 | Genuinely wired-both-ends Mac Ethernet/Thunderbolt run (distinct from the existing coordinator-Ethernet/worker-Wi-Fi data); confirm real `top_k`/experts-per-layer from `config.json`. | None — always run. |
 | 1a (EAGLE side track) | 0 | EAGLE3 uncompiled rerun + batched-vs-solo logit diff. | Exact-hash pass → Direction 2 (tree-verification) is a real lever; fail → deprioritize Direction 2 only. Does not gate Direction 1 or Stage 2. |
 | 1b (Direction 1, step 1) | 0 | Build real per-token p50/p95/p99 ITL logging into the decode loop. | Must exist before any per-token percentile claim at Stage 2 or 4 is valid. |
-| 1c (Direction 1, step 2) | 0 (colocated) | Measure t_draft, t_verify, and per-token acceptance rate α separately for the standalone/classic draft-target mechanism (real traces, not assumed). | Feeds Stage 1d; a losing colocated aggregate number does not by itself block the pipeline (see the async topic note on why colocated ≠ disaggregated). |
-| 1d (Direction 1, step 3 — modeling only) | 0 | Using 1c's measured t_draft, t_verify, α and the acceptance-aware formula (`E[T] = α^γ·max(t_draft,RTT+t_verify) + (1−α^γ)·(t_draft+RTT+t_verify)`), compute predicted E[T] across candidate RTTs and compare to the resident single-GPU baseline. | Predicted Δ_lat's sign and magnitude at the target RTT set the δ Stage 4 must clear; if no candidate RTT predicts Δ_lat < 0, that is informative and Stage 4 should not proceed yet. |
+| 1c (Direction 1, step 2) | 0 (control) + 1 per remote class tested | Measure t_draft **independently on each proposed remote hardware class** (Mac, CPU, cheap GPU) — a colocated data-center-GPU t_draft is only a control, not a substitute; measure t_verify on the target; measure RTT and serialization for each pairing; measure real per-token acceptance rate α and γ (request/round-aligned, not the coarse periodic engine log). | Feeds Stage 1d; a losing colocated-control aggregate number does not by itself block the pipeline (see the async topic note on why colocated ≠ disaggregated). |
+| 1d (Direction 1, step 3 — modeling only) | 0 | Using 1c's measured t_draft, t_verify, α (per remote hardware class) and γ, compute `E[T_async] = α^γ·max(t_draft,RTT+t_verify) + (1−α^γ)·(t_draft+RTT+t_verify)` and `E[L] = (1−α^γ)/(1−α)` (E[L]=γ at α=1) across candidate RTTs; convert to predicted ms/token as `E[T_async]/E[L]` and compare *that* (not raw E[T_async]) to the 16.589ms/token resident baseline. | Predicted Δ_lat = E[T_async]/E[L] − 16.589ms sets the δ Stage 4 must clear; if no candidate RTT/hardware-class predicts Δ_lat < 0, that is informative and Stage 4 should not proceed yet. |
 | 2 (diagnostic/boundary side track) | 1 | Sparse same-AZ remote-expert, KV-cache authoritative; same 2026-08-22 workload/exact-hash gate; pilot for variance, then power-calculated n; per-token p50/p95/p99. Estimand: Δ_lat. | End-to-end visible-ITL p95/p99 **<100ms**, and Δ_lat's CI upper bound ≤ −δ (declare improvement, informs Direction 3) or entire CI within [−ε,+ε] (declare equivalence) — a CI clearing neither means collect more data, not "not causal." |
 | 3 (Direction 3, conditional) | 1+ | Only if a future model/device doesn't fit locally: batch experts/layer into one RPC vs. llama.cpp `--n-cpu-moe`/ktransformers zero-network reference. States up front whether it uses Δ_lat or Δ_thr; same gate logic as Stage 2 with that estimand's sign. | Clears the improvement gate for its declared estimand; end-to-end p95/p99 <100ms where a latency SLA applies. |
 | 4 (Direction 1, step 4) | 1 | Only after Stage 1d predicts a plausible win at the target RTT: run the actual async disaggregated pipeline (not the colocated proxy), same exact-hash gate. Estimand: Δ_lat. | End-to-end visible-ITL p95/p99 **<100ms**, and Δ_lat's CI upper bound ≤ −δ. |
@@ -678,7 +731,8 @@ via search and its full PDF read via `Read` to disambiguate it from
 arXiv:2511.21669, whose own title/abstract were re-confirmed via search;
 CLLM's abstract fetched): the async-decoding cost model is now acceptance-aware
 (PicoSpec Eq. 8–9), not a bare max(...), with PicoSpec's own Qwen-GSM8K
-148.84ms-mean-TPOT/no-p95-p99 cell disclosed; the estimand sign is now
+cell's reported TPOT/throughput figures disclosed (refined further in the
+iteration-3 note below); the estimand sign is now
 fixed and unambiguous (Δ_lat/Δ_thr, opposite-sign conventions, explicit
 improvement/equivalence gates) across Stages 2–4; the percentile section no
 longer claims real end-to-end headroom or cross-AZ "borderline feasibility"
@@ -696,3 +750,33 @@ host RAM; and the roadmap now states explicitly that only Stages
 1b→1c→1d→4 gate Direction 1, with Stage 0/1a/2 as parallel side tracks, and
 labels the "Machines" column as machines added beyond the existing
 single-GPU baseline.
+
+**Verifier iteration-3 corrections applied**, each re-verified directly
+this pass (the retained standalone-server SGLang log read and its 32
+accept-rate/accept-length records recomputed by hand: mean 0.3353,
+range 0.25–0.40, and mean 2.3394, range 2.00–2.60 — matching the
+verifier's figures exactly; `two_node_moe.py` read to confirm it computes
+p50/p95/p99): PicoSpec's E[T_async] is now correctly labeled a **per-cycle**
+cost, with the missing conversion added — E[L]=(1−α^γ)/(1−α) (limit γ at
+α=1) and predicted ms/token = E[T_async]/E[L] — and Stage 1d and the
+Ranked-#1 direction were both fixed to compare that converted per-token
+figure to the 16.589ms/token baseline, not raw E[T_async]. PicoSpec's
+Qwen-GSM8K cell claim was corrected from "148.84ms already exceeds the
+100ms target" to a disclosed **internal inconsistency** (148.84ms labeled
+TPOT vs. ≈49.53ms/token from its own 20.19 tok/s figure, unreconciled in
+the paper, no p95/p99 either way) — inconclusive for this task's SLA, not
+a pass or fail. "Two distinct root causes" (EAGLE3/n-gram) is now "two
+distinct failure signatures," with n-gram's batch-shape explanation
+explicitly marked an unisolated hypothesis, same as EAGLE3's. The p99 claim
+is now scoped precisely: `two_node_moe.py` and retained raw
+boundary/microbenchmark results do compute/contain p99, but only for
+RPC-hop/whole-forward measurements — no end-to-end, client-visible,
+per-token ITL p99 exists for the real Qwen generation/decode experiments,
+which is the actual gap. Stage 1c (and the corresponding prerequisite-gate
+and Ranked-#1 text) now requires t_draft measured independently on each
+proposed remote hardware class (Mac, CPU, cheap GPU) — a colocated
+data-center-GPU number is a control only, not a stand-in for remote
+hardware. The retained standalone-draft SGLang log's 32 coarse periodic
+accept-rate/accept-length records are now cited as directional
+warning/initial evidence only, explicitly not a request-aligned
+PicoSpec-compatible α/γ trace without further metric-semantics mapping.

@@ -79,6 +79,13 @@ It defaults to the `mi:scratchpad` AWS profile and `us-west-2`:
 ./scripts/aws-experiment.sh
 ```
 
+`aws-status.sh` also reports the estimated current hourly burn, accrued EC2 and
+live EBS cost, and the maximum exposure through each run's `ExpiresAt` TTL. Its
+built-in rates cover the repository's default `us-west-2` instance types. Add a
+custom rate without changing the script with, for example,
+`DAI_EC2_HOURLY_RATES_JSON='{"custom.large":1.25}'`. The estimate excludes S3,
+network transfer, taxes, credits, and account discounts.
+
 The runner always invokes `tofu destroy` on exit and verifies that no live
 run-tagged instance or EBS volume remains. Every instance also has a verified
 systemd TTL timer and EC2's instance-initiated shutdown behavior is set to
@@ -114,6 +121,53 @@ seven-day object-expiration policy.
 See the [first real full-model AWS experiment](prototype/AWS-FULLMODEL-EXPERIMENT-2026-08-20.md)
 for correctness evidence, decomposed expert timings, counterbalanced forward
 results, and the remaining claim boundary.
+
+## Scratchpad generation speed experiment
+
+The earlier 1.08-second measurement is a 19-token, `use_cache=False` forward
+pass. It is retained as a placement correctness control, but it cannot measure
+time to first token (TTFT), autoregressive decode throughput, or speculative
+decoding. The generation experiment uses one fixed, exactly 1,000-token prompt,
+forces 256 output tokens, and reports TTFT, end-to-end latency, and output
+tokens/second separately.
+
+The disposable AWS runner compares four batch-one configurations on the same
+GPU node and pinned SGLang container:
+
+- ordinary SGLang tensor-parallel serving;
+- n-gram speculative decoding, which needs no draft weights; and
+- compiled EAGLE3 using a revision-pinned draft head trained for the exact base
+  model; and
+- standalone speculative decoding with Qwen3-0.6B as the draft model.
+
+```bash
+aws sso login --profile mi:scratchpad
+./scripts/aws-generation-experiment.sh
+```
+
+The default `g5.12xlarge` has enough aggregate GPU memory for the 57 GB BF16
+checkpoint. The runner refuses an instance whose current on-demand hourly price
+exceeds `DAI_MAX_HOURLY_USD` (default `$8`), verifies the private S3 checkpoint
+cache before provisioning, installs an independent instance TTL, destroys all
+run resources on exit, and checks for surviving EC2 instances and EBS volumes.
+Raw per-run artifacts remain ignored under `prototype/results/aws-generation/`.
+
+The first complete qualification used one `g7e.4xlarge` in `us-east-2` because
+the requested multi-GPU types were capacity-constrained. It found no valid 10×
+speedup: n-gram reached 5.49× raw decode throughput but did not reproduce a
+single exact output, compiled EAGLE3 reached 1.59× but diverged from the
+baseline output, and the standalone draft was slower. See the
+[generation speed report](prototype/AWS-GENERATION-EXPERIMENT-2026-08-22.md).
+
+The follow-up research closed all three candidate directions against explicit
+correctness, latency, and minimum-improvement gates. Its best raw result was
+NGRAM-16 at 6.39×, but the only exact-output configuration remained the 59.04
+tok/s baseline. See the
+[final execution report](prototype/RESEARCH-EXECUTION-2026-08-22.md) and
+[closed research ledger](prototype/RESEARCH-TODO-2026-08-22.md).
+
+A valid 10× claim requires the same generation harness and metric on both sides.
+It must not divide GPU decode tokens/second by the old one-forward latency.
 
 ## Repository hygiene
 

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update
+  # AWS DLAMIs already install Docker CE and containerd.io. Installing
+  # Ubuntu's docker.io would conflict with that pinned containerd package.
+  DEBIAN_FRONTEND=noninteractive apt-get install -y jq gzip curl
+else
+  yum install -y awscli jq gzip curl
+fi
+command -v aws >/dev/null
+systemctl enable --now docker
+
+mkdir -p /opt/dai/model /opt/dai/results /opt/dai/hf-cache
+echo '${generation_benchmark_gz_b64}' | base64 -d | gzip -dc > /opt/dai/generation_benchmark.py
+echo '${draft_profile_gz_b64}' | base64 -d | gzip -dc > /opt/dai/draft_profile.py
+echo '${native_spec_probe_gz_b64}' | base64 -d | gzip -dc > /opt/dai/native_spec_probe.py
+echo '${benchmark_prompt_gz_b64}' | base64 -d | gzip -dc > /opt/dai/benchmark-prompt.md
+chmod 0755 /opt/dai/generation_benchmark.py /opt/dai/draft_profile.py /opt/dai/native_spec_probe.py
+
+cat > /etc/systemd/system/dai-ttl-terminate.service <<'UNIT'
+[Unit]
+Description=Terminate the dAI experiment instance after its hard TTL
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/shutdown -h now
+UNIT
+
+cat > /etc/systemd/system/dai-ttl-terminate.timer <<'UNIT'
+[Unit]
+Description=Hard TTL for the dAI experiment instance
+
+[Timer]
+OnBootSec=${ttl_minutes}min
+Unit=dai-ttl-terminate.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now dai-ttl-terminate.timer
+
+if [[ '${sync_full_model}' == 'true' ]]; then
+  aws s3 sync "s3://${model_bucket}/${model_prefix}/" /opt/dai/model/ \
+    --region '${aws_region}' --only-show-errors
+  test -s /opt/dai/model/model.safetensors.index.json
+  test -s /opt/dai/model/model-00016-of-00016.safetensors
+fi
+
+docker pull '${sglang_image}'
+docker image inspect '${sglang_image}' > /opt/dai/sglang-image.json
+nvidia-smi > /opt/dai/nvidia-smi.txt
+touch /opt/dai/ready

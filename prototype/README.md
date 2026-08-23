@@ -96,3 +96,14 @@ The included `quality/quality-smoke-v1.jsonl` verifies pipeline wiring only.
 The default minimum of 100 cases prevents it from supporting a model-quality
 claim. Use a representative, licensed dataset for a claim-bearing evaluation;
 the accepted row schema is documented in `quality/README.md`.
+
+`spec_logprob_probe.py` captures the target model's emitted token IDs, emitted
+token logprobs, top candidate logprobs, and speculative counters. The AWS
+runner's `root-cause` variant set compares ordinary decode with one- and
+multi-token NGRAM verification, both speculative attention-mode flags, and an
+eager no-CUDA-graph control. It is a short numerical-parity diagnostic, not a
+throughput qualification:
+
+```bash
+DAI_VARIANT_SET=root-cause ./scripts/aws-generation-experiment.sh
+```

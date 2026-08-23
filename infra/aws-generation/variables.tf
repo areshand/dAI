@@ -55,6 +55,12 @@ variable "quality_dataset_path" {
   default     = ""
 }
 
+variable "root_cause_mode" {
+  description = "Embed only programs required by the speculative root-cause probe."
+  type        = bool
+  default     = false
+}
+
 variable "instance_type" {
   type    = string
   default = "g5.12xlarge"

@@ -29,16 +29,15 @@ locals {
     sync_full_model             = var.sync_full_model
     sglang_image                = var.sglang_image
     generation_benchmark_gz_b64 = base64gzip(file("${local.source_root}/prototype/generation_benchmark.py"))
-    quality_benchmark_gz_b64    = base64gzip(file("${local.source_root}/prototype/quality_benchmark.py"))
-    quality_dataset_gz_b64 = base64gzip(file(
-      var.quality_dataset_path != "" ? var.quality_dataset_path : "${local.source_root}/prototype/quality/quality-smoke-v1.jsonl"
-    ))
-    draft_profile_gz_b64     = base64gzip(file("${local.source_root}/prototype/draft_profile.py"))
-    native_spec_probe_gz_b64 = base64gzip(file("${local.source_root}/prototype/native_spec_probe.py"))
+    quality_benchmark_gz_b64    = var.root_cause_mode ? base64gzip("") : base64gzip(file("${local.source_root}/prototype/quality_benchmark.py"))
+    quality_dataset_gz_b64      = var.quality_dataset_path != "" ? base64gzip(file(var.quality_dataset_path)) : base64gzip("")
+    draft_profile_gz_b64        = var.root_cause_mode ? base64gzip("") : base64gzip(file("${local.source_root}/prototype/draft_profile.py"))
+    native_spec_probe_gz_b64    = var.root_cause_mode ? base64gzip("") : base64gzip(file("${local.source_root}/prototype/native_spec_probe.py"))
+    spec_logprob_probe_gz_b64   = base64gzip(file("${local.source_root}/prototype/spec_logprob_probe.py"))
     # Only the first 1,000 tokens are consumed. Keeping a bounded source avoids
-    # EC2's 25,600-byte encoded user-data limit while retaining diverse prose.
+    # EC2's 16,384-byte raw user-data limit while retaining diverse prose.
     benchmark_prompt_gz_b64 = base64gzip(substr(
-      file("${local.source_root}/moe-distributed-experiment-design.md"), 0, 16000
+      file("${local.source_root}/moe-distributed-experiment-design.md"), 0, 12000
     ))
   })
 }

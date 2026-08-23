@@ -17,9 +17,10 @@ echo '${generation_benchmark_gz_b64}' | base64 -d | gzip -dc > /opt/dai/generati
 echo '${quality_benchmark_gz_b64}' | base64 -d | gzip -dc > /opt/dai/quality_benchmark.py
 echo '${draft_profile_gz_b64}' | base64 -d | gzip -dc > /opt/dai/draft_profile.py
 echo '${native_spec_probe_gz_b64}' | base64 -d | gzip -dc > /opt/dai/native_spec_probe.py
+echo '${spec_logprob_probe_gz_b64}' | base64 -d | gzip -dc > /opt/dai/spec_logprob_probe.py
 echo '${benchmark_prompt_gz_b64}' | base64 -d | gzip -dc > /opt/dai/benchmark-prompt.md
 echo '${quality_dataset_gz_b64}' | base64 -d | gzip -dc > /opt/dai/quality/suite.jsonl
-chmod 0755 /opt/dai/generation_benchmark.py /opt/dai/quality_benchmark.py /opt/dai/draft_profile.py /opt/dai/native_spec_probe.py
+chmod 0755 /opt/dai/generation_benchmark.py /opt/dai/quality_benchmark.py /opt/dai/draft_profile.py /opt/dai/native_spec_probe.py /opt/dai/spec_logprob_probe.py
 
 cat > /etc/systemd/system/dai-ttl-terminate.service <<'UNIT'
 [Unit]

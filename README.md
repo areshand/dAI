@@ -166,6 +166,19 @@ tok/s baseline. See the
 [final execution report](prototype/RESEARCH-EXECUTION-2026-08-22.md) and
 [closed research ledger](prototype/RESEARCH-TODO-2026-08-22.md).
 
+The target-logprob follow-up isolated the temperature-zero divergence to
+numerical differences between SGLang's ordinary Triton decode-attention path
+and the Triton extend-attention path used by `TARGET_VERIFY`. Reproduce the
+short control matrix with:
+
+```bash
+DAI_VARIANT_SET=root-cause ./scripts/aws-generation-experiment.sh
+```
+
+See the
+[root-cause report](prototype/SPECULATIVE-DIVERGENCE-ROOT-CAUSE-2026-08-23.md)
+for the token-level evidence and exclusions.
+
 A valid 10× claim requires the same generation harness and metric on both sides.
 It must not divide GPU decode tokens/second by the old one-forward latency.
 

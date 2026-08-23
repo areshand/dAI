@@ -72,8 +72,10 @@ to outweigh draft compute, transfer, synchronization, rejection, and rollback.
   EAGLE3 is stable but first diverges from baseline at token 14; compiled EAGLE3
   first diverges at token 92. Compilation is therefore not the root cause.
   NGRAM and standalone also first diverge at token 14, implicating a shared
-  speculative/batch-shape numerical path, but solo-logit instrumentation is not
-  exposed by the pinned serving API, so the exact kernel remains unresolved.
+  speculative/batch-shape numerical path. A follow-up native target-logprob
+  probe isolated the boundary: ordinary iterations use Triton decode attention,
+  while `TARGET_VERIFY` uses Triton extend attention. Their BF16 logprobs differ
+  immediately after prefill and flip a reported top-1 tie at token 14.
 - [x] Capture request-aligned accepted tokens and verification counts before
   distribution: EAGLE3 121/402 and 134 cycles (1.910 output/cycle), compiled
   EAGLE3 115/426 and 142 cycles (1.803 output/cycle), standalone 155/404 and
@@ -140,9 +142,10 @@ memory/compute can beat the best local CPU/NVMe offload reference.
 - [x] Streaming granularity risk handled: raw event timestamps are retained,
   exact token ITL is reported only for one-token events, and coalesced arrivals
   are flagged instead of receiving invented sub-event times.
-- [x] EAGLE causality narrowed: compilation is ruled out; a shared speculative
-  or batch-shape numerical path is implicated. Exact kernel isolation remains a
-  separate SGLang debugging project and is not needed for the no-go gate.
+- [x] Speculative divergence isolated: compilation, draft source/window,
+  speculative attention-mode flag, and CUDA graphs are ruled out. The causal
+  boundary is SGLang's numerically non-equivalent Triton decode-attention versus
+  target-verify extend-attention paths; greedy `argmax` flips at a near-tie.
 - [x] Current Qwen model fits the target GPU; Direction 3 was closed as not
   applicable rather than testing an irrelevant artificial regime.
 - [x] L4 runtime issue: deterministic SGLang's persistent Triton matmul and its

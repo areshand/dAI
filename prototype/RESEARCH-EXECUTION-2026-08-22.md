@@ -112,8 +112,17 @@ Uncompiled EAGLE3 first differs from baseline at output token 14; compiled
 EAGLE3 first differs at token 92. Compilation therefore changes the numerical
 path but is not the root cause. NGRAM, NGRAM-16, NGRAM-32, standalone draft, and
 uncompiled EAGLE3 all first diverge at token 14, implicating a shared
-speculative/batch-shape path. The pinned API does not expose solo and tree logits
-for a direct per-kernel comparison, so the precise kernel is not isolated.
+speculative/batch-shape path.
+
+A follow-up target-logprob run isolated that path. Ordinary generation routes
+the target through Triton decode attention, while `TARGET_VERIFY` routes it
+through Triton extend attention (the unified extend kernel in deterministic
+mode). Their BF16 logits differ starting with the first post-prefill step. At
+position 14, an exact reported baseline tie between token IDs 20317 and 34920
+became a 0.125 log-prob lead for 34920 in target-verify mode, flipping greedy
+`argmax`. One-token drafts, disabling CUDA graphs, and both speculative
+attention-mode flags produced the same alternative stream. See
+[`SPECULATIVE-DIVERGENCE-ROOT-CAUSE-2026-08-23.md`](SPECULATIVE-DIVERGENCE-ROOT-CAUSE-2026-08-23.md).
 
 Tree-node count, expert union, model bytes, and remote drafter redundancy were
 not measured after the exact-output prerequisite failed. Scaling this path

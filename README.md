@@ -169,6 +169,40 @@ tok/s baseline. See the
 A valid 10× claim requires the same generation harness and metric on both sides.
 It must not divide GPU decode tokens/second by the old one-forward latency.
 
+### Quality-qualified 100 tok/s gate
+
+The provider-oriented gate treats exact BF16 token identity as a debugging
+signal, not as the product-quality definition. It runs the fixed speed contract
+and a separate objective-answer suite against the baseline, NGRAM-16, and
+compiled EAGLE3, then requires all of:
+
+- at least 100 paired quality cases;
+- a paired-bootstrap 95% lower bound no worse than two percentage points below
+  baseline quality;
+- at least 100 mean generated tokens/second;
+- p99 visible stream-event gap below 100 ms; and
+- p99 TTFT below 250 ms.
+
+Run the included pipeline smoke suite with:
+
+```bash
+DAI_VARIANT_SET=quality ./scripts/aws-generation-experiment.sh
+```
+
+The bundled 16-case suite cannot qualify a result because it is intentionally
+below the 100-case minimum. For a claim-bearing run, point the runner at a
+representative JSONL suite:
+
+```bash
+DAI_VARIANT_SET=quality \
+DAI_QUALITY_DATASET_LOCAL=/absolute/path/to/quality-suite.jsonl \
+./scripts/aws-generation-experiment.sh
+```
+
+See [`prototype/quality/README.md`](prototype/quality/README.md) for the dataset
+schema and claim boundary. Quality prompts retain their natural lengths; speed
+remains measured on the fixed 1,000-input/256-output-token workload.
+
 ## Repository hygiene
 
 Model checkpoints, extracted weights, tensor outputs, virtual environments,

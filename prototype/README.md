@@ -82,3 +82,17 @@ cross-AZ worker. It uses real-expert calls for discovery, randomizes the three
 paths within each block, and checks routes, final logits, and greedy token
 against the local reference. `scripts/aws-fullmodel-experiment.sh` provisions
 and destroys the corresponding Linux cell.
+
+## Generation quality gate
+
+`quality_benchmark.py` runs objective JSONL cases through Qwen's chat template
+with thinking disabled and records case-level scores, responses, and total time.
+`compare_quality_results.py` applies a paired-bootstrap non-inferiority test and
+combines it with the fixed generation benchmark's 100 tok/s, p99 visible-pause,
+and p99 TTFT gates. `scripts/aws-generation-experiment.sh` enables this path
+with `DAI_VARIANT_SET=quality`.
+
+The included `quality/quality-smoke-v1.jsonl` verifies pipeline wiring only.
+The default minimum of 100 cases prevents it from supporting a model-quality
+claim. Use a representative, licensed dataset for a claim-bearing evaluation;
+the accepted row schema is documented in `quality/README.md`.

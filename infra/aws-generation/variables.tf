@@ -49,6 +49,12 @@ variable "sync_full_model" {
   default     = true
 }
 
+variable "quality_dataset_path" {
+  description = "Local JSONL quality suite embedded into the disposable instance."
+  type        = string
+  default     = ""
+}
+
 variable "instance_type" {
   type    = string
   default = "g5.12xlarge"

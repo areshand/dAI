@@ -2,6 +2,15 @@
 
 Date: 2026-08-22
 
+> **2026-08-24 correction:** The 59.04 tok/s reference below is the
+> batch-invariant deterministic Triton diagnostic configuration, not the best
+> target-only production configuration. A cold-cache confirmation with
+> FlashInfer attention/sampling, CUDA graphs, BF16, TP1, no deterministic flag,
+> and no speculation measured 168.25 pooled tok/s. The speculative comparisons
+> below remain valid within their paired diagnostic run, but they do not show
+> that the model itself is limited to 59 tok/s. See
+> [TARGET-ONLY-100-TPS-2026-08-24.md](TARGET-ONLY-100-TPS-2026-08-24.md).
+
 ## Decision
 
 The current system does **not** have a correctness-qualified path to 10x

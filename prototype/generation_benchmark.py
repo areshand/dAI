@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark a warmed OpenAI-compatible completion server with an exact token prompt."""
+"""Benchmark an OpenAI-compatible completion server with an exact token prompt."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import math
 import statistics
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,14 @@ def distribution(values: list[float]) -> dict[str, float | int]:
         "p99": percentile(values, 0.99),
         "max": max(values),
     }
+
+
+def pooled_output_tps(runs: list[dict]) -> float:
+    """Compute aggregate steady-decode throughput without averaging ratios."""
+
+    output_tokens = sum(max(0, int(run["output_tokens"]) - 1) for run in runs)
+    stream_seconds = sum(float(run["stream_seconds"]) for run in runs)
+    return output_tokens / stream_seconds if stream_seconds > 0 else 0.0
 
 
 def streaming_trace(events: list[dict], tokenizer) -> dict:
@@ -186,6 +195,19 @@ def stream_completion(
     }
 
 
+def flush_server_cache(endpoint: str, timeout: float) -> None:
+    """Flush SGLang's radix cache so repeated prompts measure cold prefill."""
+
+    query = urllib.parse.urlencode({"timeout": timeout})
+    request = urllib.request.Request(
+        endpoint.rstrip("/") + "/flush_cache?" + query,
+        data=b"",
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout + 10) as response:
+        response.read()
+
+
 def main() -> None:
     from transformers import AutoTokenizer
 
@@ -199,6 +221,12 @@ def main() -> None:
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument(
+        "--cache-policy",
+        choices=("warm", "cold"),
+        default="warm",
+        help="Use the radix cache or flush it before each request after the first warmup",
+    )
     parser.add_argument("--nonce", default="dai-generation-v1")
     parser.add_argument(
         "--prompt-file",
@@ -206,6 +234,8 @@ def main() -> None:
     )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    if args.cache_policy == "cold" and args.warmups < 1:
+        parser.error("--cache-policy cold requires at least one warmup")
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True)
     source_text = (
@@ -217,13 +247,27 @@ def main() -> None:
     prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
     runs = []
+    cache_flush_count = 0
     for index in range(args.warmups + args.repetitions):
+        # SGLang can hang if /flush_cache is the first request after startup.
+        # Let one unmeasured request initialize the runtime, then make every
+        # subsequent request cold without including flush time in TTFT.
+        if args.cache_policy == "cold" and index > 0:
+            flush_server_cache(args.endpoint, min(args.timeout, 60.0))
+            cache_flush_count += 1
         result = stream_completion(
             args.endpoint, args.model, prompt, args.max_tokens, args.timeout
         )
         trace = streaming_trace(result.pop("stream_events"), tokenizer)
         output_ids = tokenizer.encode(result.pop("text"), add_special_tokens=False)
-        output_count = int((result.get("usage") or {}).get("completion_tokens") or len(output_ids))
+        output_count = int(
+            (result.get("usage") or {}).get("completion_tokens") or len(output_ids)
+        )
+        if output_count != args.max_tokens:
+            raise RuntimeError(
+                f"request {index} returned {output_count} completion tokens; "
+                f"expected exactly {args.max_tokens}"
+            )
         decode_seconds = result["stream_seconds"]
         output_tps = (
             max(0, output_count - 1) / decode_seconds
@@ -256,11 +300,14 @@ def main() -> None:
         "max_tokens": args.max_tokens,
         "warmups": args.warmups,
         "repetitions": args.repetitions,
+        "cache_policy": args.cache_policy,
+        "cache_flush_count": cache_flush_count,
         "summary": {
             "ttft_seconds": distribution([run["ttft_seconds"] for run in measured]),
             "total_seconds": distribution([run["total_seconds"] for run in measured]),
             "output_tokens": distribution([run["output_tokens"] for run in measured]),
             "output_tps": distribution([run["output_tps"] for run in measured]),
+            "pooled_output_tps": pooled_output_tps(measured),
             "stream_event_interarrival_seconds": distribution([
                 value
                 for run in measured

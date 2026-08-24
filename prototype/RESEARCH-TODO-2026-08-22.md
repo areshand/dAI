@@ -1,6 +1,26 @@
 # Single-request heterogeneous scaling research TODO
 
-Updated: 2026-08-22
+Updated: 2026-08-24
+
+## Production-fast baseline correction
+
+- [x] Restore the production-fast target-only configuration: BF16, TP1,
+  FlashInfer attention/sampling, CUDA graphs, no deterministic-inference flag,
+  and no speculative algorithm.
+- [x] Add cold-cache benchmarking by flushing SGLang's radix cache after the
+  first warmup and before every later request. The confirmatory log records
+  twelve 1,000-new-token/zero-cached-token requests.
+- [x] Confirm the fixed 1,000-input/256-output batch-one contract on one G7e:
+  168.25 pooled tok/s, 66.1 ms mean TTFT, 1.582 s mean end-to-end, and one stable
+  output hash across ten measured repetitions.
+- [x] Reclaim the run: OpenTofu destroyed all ten resources, followed by
+  independent zero-instance and zero-EBS queries.
+- [ ] Run the full agentic-coding quality suite on this production-fast target
+  path. Target-only BF16 inference introduces no draft or approximation, but
+  its token stream is not promised to be bit-identical to batch-invariant
+  deterministic Triton at greedy near-ties.
+- [ ] If causal attribution matters, run the remaining 2x2 backend/determinism
+  screen. This is no longer required to meet 100 tok/s.
 
 ## Objective and fixed gates
 

@@ -13,6 +13,7 @@ DAI_SGLANG_IMAGE=${DAI_SGLANG_IMAGE:-lmsysorg/sglang:v0.5.16}
 DAI_MODEL_PREFIX=${DAI_MODEL_PREFIX:-qwen3-30b-a3b}
 DAI_MODEL_LOCAL=${DAI_MODEL_LOCAL:-$DAI_ROOT/model-cache/qwen3-30b-a3b}
 DAI_MODEL_BUCKET=${DAI_MODEL_BUCKET:-}
+DAI_MODEL_CACHE_REGION=${DAI_MODEL_CACHE_REGION:-us-west-2}
 DAI_QUALITY_DATASET_LOCAL=${DAI_QUALITY_DATASET_LOCAL:-$DAI_ROOT/prototype/quality/quality-smoke-v1.jsonl}
 DAI_QUALITY_REPETITIONS=${DAI_QUALITY_REPETITIONS:-1}
 DAI_QUALITY_MARGIN=${DAI_QUALITY_MARGIN:-0.02}
@@ -24,14 +25,25 @@ DAI_TTL_MINUTES=${DAI_AWS_TTL_MINUTES:-180}
 DAI_MAX_HOURLY_USD=${DAI_MAX_HOURLY_USD:-8}
 DAI_EXPECTED_HOURLY_USD=${DAI_EXPECTED_HOURLY_USD:-}
 DAI_VARIANT_SET=${DAI_VARIANT_SET:-qualification}
-# SGLang documents Triton as a deterministic backend for Qwen3-30B-A3B. The
-# FlashInfer deterministic path overflowed its prefill workspace on G7e
-# (Blackwell), so qualification runs pin Triton instead of silently falling
-# back to a non-reproducible backend.
-DAI_COMMON_SERVER_ARGS=${DAI_COMMON_SERVER_ARGS:---random-seed 1234 --enable-deterministic-inference --attention-backend triton}
-if [[ "$DAI_VARIANT_SET" != "qualification" && "$DAI_VARIANT_SET" != "all" && "$DAI_VARIANT_SET" != "quality" && "$DAI_VARIANT_SET" != "draft-profile" && "$DAI_VARIANT_SET" != "root-cause" ]]; then
-  echo "ERROR: DAI_VARIANT_SET must be qualification, all, quality, draft-profile, or root-cause." >&2
+if [[ "$DAI_VARIANT_SET" != "qualification" && "$DAI_VARIANT_SET" != "all" && "$DAI_VARIANT_SET" != "quality" && "$DAI_VARIANT_SET" != "draft-profile" && "$DAI_VARIANT_SET" != "root-cause" && "$DAI_VARIANT_SET" != "target-only" ]]; then
+  echo "ERROR: DAI_VARIANT_SET must be qualification, all, quality, draft-profile, root-cause, or target-only." >&2
   exit 1
+fi
+# Production qualification must exercise SGLang's optimized default backend.
+# Deterministic Triton is retained only for numerical root-cause work: on G7e it
+# reduces the same target-only model from about 170 tok/s to about 59 tok/s.
+if [[ -z "${DAI_COMMON_SERVER_ARGS+x}" ]]; then
+  if [[ "$DAI_VARIANT_SET" == "root-cause" ]]; then
+    DAI_COMMON_SERVER_ARGS="--random-seed 1234 --enable-deterministic-inference --attention-backend triton"
+  else
+    DAI_COMMON_SERVER_ARGS="--random-seed 1234"
+  fi
+fi
+if [[ -z "${DAI_CACHE_POLICY+x}" ]]; then
+  DAI_CACHE_POLICY=cold
+  if [[ "$DAI_VARIANT_SET" == "root-cause" ]]; then
+    DAI_CACHE_POLICY=warm
+  fi
 fi
 if [[ "$DAI_VARIANT_SET" == "root-cause" ]]; then
   DAI_BENCH_MAX_TOKENS=${DAI_BENCH_MAX_TOKENS:-128}
@@ -153,7 +165,7 @@ run_variant() {
   if [[ "$DAI_VARIANT_SET" == "root-cause" ]]; then
     logprob_probe_command="docker exec dai-sglang python3 /opt/dai/spec_logprob_probe.py --endpoint http://127.0.0.1:30000 --tokenizer /models/qwen3 --variant '$variant' --prompt-file /opt/dai/benchmark-prompt.md --prompt-tokens 1000 --max-tokens 128 --top-logprobs 10 --nonce dai-generation-v2 --output /opt/dai/results/${variant}-logprobs.json; aws s3 cp /opt/dai/results/${variant}-logprobs.json 's3://$DAI_BUCKET/results/${variant}-logprobs.json' --region '$DAI_REGION' --only-show-errors;"
   fi
-  benchmark_command="set -euo pipefail; docker exec dai-sglang python3 /opt/dai/generation_benchmark.py --endpoint http://127.0.0.1:30000 --model qwen3-30b-a3b --tokenizer /models/qwen3 --variant '$variant' --prompt-file /opt/dai/benchmark-prompt.md --prompt-tokens 1000 --max-tokens '$DAI_BENCH_MAX_TOKENS' --warmups '$DAI_BENCH_WARMUPS' --repetitions '$DAI_BENCH_REPETITIONS' --nonce dai-generation-v2 --output '$remote_result'; $quality_command $spec_probe_command $logprob_probe_command curl -fsS http://127.0.0.1:30000/get_server_info > /opt/dai/results/${variant}-server-info.json; docker logs dai-sglang > /opt/dai/results/${variant}-server.log 2>&1; aws s3 cp '$remote_result' 's3://$DAI_BUCKET/results/${variant}.json' --region '$DAI_REGION' --only-show-errors; aws s3 cp /opt/dai/results/${variant}-server-info.json 's3://$DAI_BUCKET/results/${variant}-server-info.json' --region '$DAI_REGION' --only-show-errors; aws s3 cp /opt/dai/results/${variant}-server.log 's3://$DAI_BUCKET/results/${variant}-server.log' --region '$DAI_REGION' --only-show-errors; docker rm -f dai-sglang >/dev/null"
+  benchmark_command="set -euo pipefail; docker exec dai-sglang python3 /opt/dai/generation_benchmark.py --endpoint http://127.0.0.1:30000 --model qwen3-30b-a3b --tokenizer /models/qwen3 --variant '$variant' --prompt-file /opt/dai/benchmark-prompt.md --prompt-tokens 1000 --max-tokens '$DAI_BENCH_MAX_TOKENS' --warmups '$DAI_BENCH_WARMUPS' --repetitions '$DAI_BENCH_REPETITIONS' --cache-policy '$DAI_CACHE_POLICY' --nonce dai-generation-v2 --output '$remote_result'; $quality_command $spec_probe_command $logprob_probe_command curl -fsS http://127.0.0.1:30000/get_server_info > /opt/dai/results/${variant}-server-info.json; docker logs dai-sglang > /opt/dai/results/${variant}-server.log 2>&1; aws s3 cp '$remote_result' 's3://$DAI_BUCKET/results/${variant}.json' --region '$DAI_REGION' --only-show-errors; aws s3 cp /opt/dai/results/${variant}-server-info.json 's3://$DAI_BUCKET/results/${variant}-server-info.json' --region '$DAI_REGION' --only-show-errors; aws s3 cp /opt/dai/results/${variant}-server.log 's3://$DAI_BUCKET/results/${variant}-server.log' --region '$DAI_REGION' --only-show-errors; docker rm -f dai-sglang >/dev/null"
   DAI_COMMAND_ID=$(send_command "$benchmark_command" 7200)
   echo "Benchmarking $variant ($DAI_COMMAND_ID)"
   wait_for_command "$DAI_COMMAND_ID" "$DAI_INSTANCE" 720
@@ -171,9 +183,26 @@ run_variant() {
     aws s3 cp --profile "$DAI_PROFILE" --region "$DAI_REGION" \
       "s3://$DAI_BUCKET/results/${variant}-logprobs.json" "$DAI_RESULT_DIR/${variant}-logprobs.json" --only-show-errors
   fi
-  jq -e --argjson max_tokens "$DAI_BENCH_MAX_TOKENS" --argjson repetitions "$DAI_BENCH_REPETITIONS" \
-    '.schema == "dai-openai-generation-benchmark.v2" and .prompt_tokens == 1000 and .max_tokens == $max_tokens and .repetitions == $repetitions' \
+  jq -e --arg cache_policy "$DAI_CACHE_POLICY" --argjson max_tokens "$DAI_BENCH_MAX_TOKENS" \
+    --argjson warmups "$DAI_BENCH_WARMUPS" --argjson repetitions "$DAI_BENCH_REPETITIONS" \
+    '.schema == "dai-openai-generation-benchmark.v2" and .prompt_tokens == 1000 and
+     .max_tokens == $max_tokens and .repetitions == $repetitions and
+     .cache_policy == $cache_policy and
+     .cache_flush_count == (if $cache_policy == "cold" then $warmups + $repetitions - 1 else 0 end) and
+     ([.runs[] | select(.measured) | .output_tokens == $max_tokens] | all)' \
     "$DAI_RESULT_DIR/${variant}.json" >/dev/null
+  if [[ "$DAI_VARIANT_SET" == "target-only" ]]; then
+    jq -e --argjson tp_size "$DAI_TP_SIZE" '.attention_backend == "flashinfer" and .sampling_backend == "flashinfer" and
+      .enable_deterministic_inference == false and .disable_cuda_graph == false and
+      .speculative_algorithm == null and .dtype == "bfloat16" and .tp_size == $tp_size' \
+      "$DAI_RESULT_DIR/${variant}-server-info.json" >/dev/null
+    DAI_COLD_REQUESTS=$(grep -c '#new-token: 1000, #cached-token: 0' \
+      "$DAI_RESULT_DIR/${variant}-server.log" || true)
+    if [[ "$DAI_COLD_REQUESTS" -lt $((DAI_BENCH_WARMUPS + DAI_BENCH_REPETITIONS)) ]]; then
+      echo "ERROR: server log contains only $DAI_COLD_REQUESTS cold 1,000-token requests." >&2
+      return 1
+    fi
+  fi
   DAI_RESULT_FILES+=("$DAI_RESULT_DIR/${variant}.json")
   if [[ "$DAI_VARIANT_SET" == "quality" ]]; then
     aws s3 cp --profile "$DAI_PROFILE" --region "$DAI_REGION" \
@@ -218,7 +247,7 @@ if tofu -chdir="$DAI_TOFU_DIR" state list 2>/dev/null | grep -q .; then
   exit 1
 fi
 DAI_ACCOUNT=$(aws sts get-caller-identity --profile "$DAI_PROFILE" --query Account --output text)
-DAI_MODEL_BUCKET=${DAI_MODEL_BUCKET:-dai-${DAI_ACCOUNT}-model-cache-${DAI_REGION}}
+DAI_MODEL_BUCKET=${DAI_MODEL_BUCKET:-dai-${DAI_ACCOUNT}-model-cache-${DAI_MODEL_CACHE_REGION}}
 
 if [[ "$DAI_VARIANT_SET" != "draft-profile" ]]; then
   if [[ ! -s "$DAI_MODEL_LOCAL/model.safetensors.index.json" ]]; then
@@ -272,7 +301,7 @@ jq -n --arg profile "$DAI_PROFILE" --arg region "$DAI_REGION" --arg run_id "$DAI
   --arg model_prefix "$DAI_MODEL_PREFIX" --arg instance_type "$DAI_INSTANCE_TYPE" \
   --arg sglang_image "$DAI_SGLANG_IMAGE" --arg quality_dataset_path "$DAI_EMBED_QUALITY_DATASET" \
   --argjson ttl "$DAI_TTL_MINUTES" \
-  --argjson root_cause_mode "$([[ "$DAI_VARIANT_SET" == "root-cause" ]] && echo true || echo false)" \
+  --argjson root_cause_mode "$([[ "$DAI_VARIANT_SET" == "root-cause" || "$DAI_VARIANT_SET" == "target-only" ]] && echo true || echo false)" \
   --argjson sync_full_model "$([[ "$DAI_VARIANT_SET" == "draft-profile" ]] && echo false || echo true)" \
   '{aws_profile:$profile,aws_region:$region,run_id:$run_id,expires_at_utc:$expires,
     ttl_minutes:$ttl,subnet_id:$subnet,model_bucket:$model_bucket,model_prefix:$model_prefix,
@@ -312,6 +341,9 @@ if [[ "$DAI_VARIANT_SET" == "draft-profile" ]]; then
 fi
 
 case "$DAI_VARIANT_SET" in
+  target-only)
+    run_variant baseline ""
+    ;;
   qualification)
     run_variant baseline ""
     run_variant ngram "--speculative-algorithm NGRAM"

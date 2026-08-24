@@ -161,8 +161,15 @@ baseline output, and the standalone draft was slower. See the
 
 The follow-up research closed all three candidate directions against explicit
 correctness, latency, and minimum-improvement gates. Its best raw result was
-NGRAM-16 at 6.39×, but the only exact-output configuration remained the 59.04
-tok/s baseline. See the
+NGRAM-16 at 6.39× versus a deliberately deterministic Triton diagnostic
+baseline. That 59.04 tok/s cell is not the production-speed baseline.
+
+A fresh target-only qualification restored SGLang's optimized defaults and
+measured **168.25 pooled output tok/s** on the same model and G7e. Every one of
+ten cold-cache requests had exactly 1,000 uncached input tokens and 256 output
+tokens; mean TTFT was 66.1 ms and mean end-to-end latency was 1.582 s. No draft,
+speculation, quantization, or extra machine was involved. See the
+[100 tok/s qualification](prototype/TARGET-ONLY-100-TPS-2026-08-24.md), the
 [final execution report](prototype/RESEARCH-EXECUTION-2026-08-22.md) and
 [closed research ledger](prototype/RESEARCH-TODO-2026-08-22.md).
 

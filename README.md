@@ -17,6 +17,9 @@ expert popularity, compute time, and transfer cost to make that decision.
 - [`prototype/EXPERIMENT-2026-08-20.md`](prototype/EXPERIMENT-2026-08-20.md):
   the first two-Mac correctness, latency, shadow-oracle, and paired-placement
   findings.
+- [`docs/routed-expert-capture.md`](docs/routed-expert-capture.md): request-,
+  token-, and layer-level Qwen MoE route capture plus co-location analysis for
+  the four-node low-VRAM testbed.
 
 ## Current evidence
 

@@ -1,4 +1,9 @@
+import base64
+import gzip
+import json
+import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -7,11 +12,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import generation_benchmark
 from generation_benchmark import (
+    decode_routed_experts,
     distribution,
+    expert_owner,
     flush_server_cache,
     percentile,
     pooled_output_tps,
+    routed_experts_from_event,
+    summarize_expert_routes,
     streaming_trace,
+    write_expert_route_jsonl,
 )
 
 
@@ -85,6 +95,101 @@ class StatisticsTest(unittest.TestCase):
         )
         self.assertEqual(request.method, "POST")
         self.assertEqual(opened.call_args.kwargs["timeout"], 40.0)
+
+    def test_routed_experts_from_response_level_extension(self):
+        self.assertEqual(
+            routed_experts_from_event({
+                "choices": [],
+                "sgl_ext": {"routed_experts": "encoded"},
+            }),
+            "encoded",
+        )
+
+    def test_routed_experts_from_choice_extension(self):
+        self.assertEqual(
+            routed_experts_from_event({
+                "choices": [{"sglext": {"routed_experts": "encoded"}}],
+            }),
+            "encoded",
+        )
+
+    def test_decode_routed_experts_uses_token_layer_topk_shape(self):
+        expert_ids = list(range(8))
+        encoded = base64.b64encode(struct.pack("<8i", *expert_ids)).decode()
+        self.assertEqual(
+            decode_routed_experts(encoded, num_layers=2, top_k=2, experts_per_layer=8),
+            [
+                [[0, 1], [2, 3]],
+                [[4, 5], [6, 7]],
+            ],
+        )
+
+    def test_decode_routed_experts_rejects_invalid_shape(self):
+        encoded = base64.b64encode(struct.pack("<3i", 0, 1, 2)).decode()
+        with self.assertRaisesRegex(ValueError, "not divisible"):
+            decode_routed_experts(encoded, num_layers=2, top_k=2, experts_per_layer=8)
+
+    def test_expert_owner_uses_contiguous_trivial_placement(self):
+        self.assertEqual(expert_owner(0, 128, 4), 0)
+        self.assertEqual(expert_owner(31, 128, 4), 0)
+        self.assertEqual(expert_owner(32, 128, 4), 1)
+        self.assertEqual(expert_owner(127, 128, 4), 3)
+
+    def test_summary_counts_hotness_pairs_and_worker_fanout(self):
+        captures = [{
+            "request_index": 1,
+            "server_request_id": "cmpl-test",
+            "measured": True,
+            "start_token_position": 10,
+            "routes": [
+                [[0, 4], [1, 2]],
+                [[0, 1], [5, 7]],
+            ],
+        }]
+        result = summarize_expert_routes(
+            captures,
+            num_layers=2,
+            top_k=2,
+            experts_per_layer=8,
+            ep_size=2,
+        )
+        self.assertEqual(result["token_layer_rows"], 4)
+        self.assertEqual(result["worker_fanout_token_layer_counts"], {"1": 3, "2": 1})
+        self.assertEqual(result["cross_worker_token_layer_fraction"], 0.25)
+        self.assertEqual(result["layers"][0]["expert_activation_counts"][0], 2)
+        self.assertEqual(
+            result["layers"][0]["coactivation_pairs"],
+            [
+                {"experts": [0, 1], "count": 1},
+                {"experts": [0, 4], "count": 1},
+            ],
+        )
+
+    def test_route_jsonl_identifies_request_token_layer_and_workers(self):
+        captures = [{
+            "request_index": 3,
+            "server_request_id": "cmpl-test",
+            "measured": True,
+            "start_token_position": 9,
+            "routes": [[[0, 4], [1, 2]]],
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "routes.jsonl.gz"
+            write_expert_route_jsonl(
+                captures,
+                output,
+                prompt_tokens=10,
+                experts_per_layer=8,
+                ep_size=2,
+            )
+            with gzip.open(output, "rt", encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["request_index"], 3)
+        self.assertEqual(rows[0]["token_position"], 9)
+        self.assertEqual(rows[0]["phase"], "prompt")
+        self.assertEqual(rows[0]["expert_ids"], [0, 4])
+        self.assertEqual(rows[0]["worker_ranks"], [0, 1])
 
 
 if __name__ == "__main__":

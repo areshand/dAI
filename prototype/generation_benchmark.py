@@ -4,14 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import gzip
 import hashlib
 import json
 import math
 import statistics
+import struct
 import time
 import urllib.parse
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
+from itertools import combinations
 from pathlib import Path
 
 DEFAULT_SEED_TEXT = (
@@ -53,6 +59,195 @@ def pooled_output_tps(runs: list[dict]) -> float:
     output_tokens = sum(max(0, int(run["output_tokens"]) - 1) for run in runs)
     stream_seconds = sum(float(run["stream_seconds"]) for run in runs)
     return output_tokens / stream_seconds if stream_seconds > 0 else 0.0
+
+
+def routed_experts_from_event(event: dict) -> str | None:
+    """Extract SGLang's routed-expert payload across response schema versions."""
+
+    containers = [event.get("sgl_ext"), event.get("sglext")]
+    containers.extend(
+        choice.get("sgl_ext") or choice.get("sglext")
+        for choice in event.get("choices") or []
+        if isinstance(choice, dict)
+    )
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        value = container.get("routed_experts")
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):
+            for item in value.values():
+                if isinstance(item, str) and item:
+                    return item
+    return None
+
+
+def decode_routed_experts(
+    encoded: str,
+    num_layers: int,
+    top_k: int,
+    experts_per_layer: int,
+) -> list[list[list[int]]]:
+    """Decode SGLang's flattened base64 int32 `[token, layer, top_k]` tensor."""
+
+    if num_layers <= 0 or top_k <= 0 or experts_per_layer <= 0:
+        raise ValueError("routed-expert dimensions must be positive")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("routed experts are not valid base64") from exc
+    if len(raw) % 4:
+        raise ValueError("routed-expert payload is not aligned to int32")
+    count = len(raw) // 4
+    token_stride = num_layers * top_k
+    if count == 0 or count % token_stride:
+        raise ValueError(
+            f"routed-expert element count {count} is not divisible by "
+            f"num_layers*top_k={token_stride}"
+        )
+    expert_ids = list(struct.unpack(f"<{count}i", raw))
+    invalid = [expert for expert in expert_ids if not 0 <= expert < experts_per_layer]
+    if invalid:
+        raise ValueError(f"routed-expert payload contains invalid expert id {invalid[0]}")
+
+    routes = []
+    for token_start in range(0, count, token_stride):
+        token_routes = []
+        for layer_start in range(token_start, token_start + token_stride, top_k):
+            selected = expert_ids[layer_start:layer_start + top_k]
+            if len(set(selected)) != top_k:
+                raise ValueError("a token-layer route contains duplicate expert ids")
+            token_routes.append(selected)
+        routes.append(token_routes)
+    return routes
+
+
+def expert_owner(expert_id: int, experts_per_layer: int, ep_size: int) -> int:
+    if experts_per_layer % ep_size:
+        raise ValueError("experts_per_layer must be divisible by ep_size")
+    return expert_id // (experts_per_layer // ep_size)
+
+
+def summarize_expert_routes(
+    captures: list[dict],
+    num_layers: int,
+    top_k: int,
+    experts_per_layer: int,
+    ep_size: int,
+) -> dict:
+    """Build placement inputs: per-layer hotness, co-activation, and EP fanout."""
+
+    experts_per_worker = experts_per_layer // ep_size
+    if experts_per_worker * ep_size != experts_per_layer:
+        raise ValueError("experts_per_layer must be divisible by ep_size")
+    expert_counts = [[0] * experts_per_layer for _ in range(num_layers)]
+    pair_counts = [Counter() for _ in range(num_layers)]
+    worker_counts = [[0] * ep_size for _ in range(num_layers)]
+    fanout_counts = Counter()
+    token_layer_rows = 0
+    request_summaries = []
+
+    for capture in captures:
+        routes = capture["routes"]
+        request_summaries.append({
+            "request_index": capture["request_index"],
+            "server_request_id": capture.get("server_request_id"),
+            "start_token_position": capture["start_token_position"],
+            "captured_tokens": len(routes),
+        })
+        for token_routes in routes:
+            if len(token_routes) != num_layers:
+                raise ValueError("captured route has the wrong number of layers")
+            for layer, experts in enumerate(token_routes):
+                if len(experts) != top_k:
+                    raise ValueError("captured route has the wrong top-k width")
+                owners = set()
+                for expert in experts:
+                    expert_counts[layer][expert] += 1
+                    owner = expert_owner(expert, experts_per_layer, ep_size)
+                    worker_counts[layer][owner] += 1
+                    owners.add(owner)
+                for left, right in combinations(sorted(experts), 2):
+                    pair_counts[layer][(left, right)] += 1
+                fanout_counts[len(owners)] += 1
+                token_layer_rows += 1
+
+    layer_summaries = []
+    for layer in range(num_layers):
+        layer_summaries.append({
+            "layer": layer,
+            "expert_activation_counts": expert_counts[layer],
+            "worker_activation_counts": worker_counts[layer],
+            "coactivation_pairs": [
+                {"experts": [left, right], "count": count}
+                for (left, right), count in sorted(
+                    pair_counts[layer].items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            ],
+        })
+
+    return {
+        "schema": "dai-expert-placement-summary.v1",
+        "request_count": len(captures),
+        "token_layer_rows": token_layer_rows,
+        "num_layers": num_layers,
+        "top_k": top_k,
+        "experts_per_layer": experts_per_layer,
+        "expert_parallel_size": ep_size,
+        "placement": [
+            {
+                "worker_rank": rank,
+                "expert_id_start": rank * experts_per_worker,
+                "expert_id_end_exclusive": (rank + 1) * experts_per_worker,
+            }
+            for rank in range(ep_size)
+        ],
+        "worker_fanout_token_layer_counts": {
+            str(fanout): fanout_counts.get(fanout, 0)
+            for fanout in range(1, ep_size + 1)
+        },
+        "cross_worker_token_layer_fraction": (
+            sum(count for fanout, count in fanout_counts.items() if fanout > 1)
+            / token_layer_rows
+            if token_layer_rows
+            else 0.0
+        ),
+        "requests": request_summaries,
+        "layers": layer_summaries,
+    }
+
+
+def write_expert_route_jsonl(
+    captures: list[dict],
+    output: Path,
+    prompt_tokens: int,
+    experts_per_layer: int,
+    ep_size: int,
+) -> None:
+    """Write one auditable row per request/token/layer, optionally gzip-compressed."""
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    opener = gzip.open if output.suffix == ".gz" else open
+    with opener(output, "wt", encoding="utf-8") as handle:
+        for capture in captures:
+            for token_offset, token_routes in enumerate(capture["routes"]):
+                token_position = capture["start_token_position"] + token_offset
+                for layer, experts in enumerate(token_routes):
+                    handle.write(json.dumps({
+                        "request_index": capture["request_index"],
+                        "server_request_id": capture.get("server_request_id"),
+                        "measured": capture["measured"],
+                        "token_position": token_position,
+                        "phase": "prompt" if token_position < prompt_tokens else "decode",
+                        "layer": layer,
+                        "expert_ids": experts,
+                        "worker_ranks": [
+                            expert_owner(expert, experts_per_layer, ep_size)
+                            for expert in experts
+                        ],
+                    }, separators=(",", ":")) + "\n")
 
 
 def streaming_trace(events: list[dict], tokenizer) -> dict:
@@ -138,8 +333,10 @@ def stream_completion(
     prompt: str,
     max_tokens: int,
     timeout: float,
+    return_routed_experts: bool = False,
+    routed_experts_start_len: int = 0,
 ) -> dict:
-    payload = json.dumps({
+    request_body = {
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
@@ -147,7 +344,13 @@ def stream_completion(
         "ignore_eos": True,
         "stream": True,
         "stream_options": {"include_usage": True},
-    }).encode("utf-8")
+    }
+    if return_routed_experts:
+        request_body.update({
+            "return_routed_experts": True,
+            "routed_experts_start_len": routed_experts_start_len,
+        })
+    payload = json.dumps(request_body).encode("utf-8")
     request = urllib.request.Request(
         endpoint.rstrip("/") + "/v1/completions",
         data=payload,
@@ -159,6 +362,8 @@ def stream_completion(
     pieces: list[str] = []
     stream_events: list[dict[str, float | str]] = []
     usage = None
+    server_request_id = None
+    routed_experts_base64 = None
     with urllib.request.urlopen(request, timeout=timeout) as response:
         for raw_line in response:
             line = raw_line.decode("utf-8").strip()
@@ -168,8 +373,15 @@ def stream_completion(
             if data == "[DONE]":
                 break
             event = json.loads(data)
+            if event.get("id"):
+                server_request_id = event["id"]
             if event.get("usage"):
                 usage = event["usage"]
+            routed = routed_experts_from_event(event)
+            if routed:
+                if routed_experts_base64 and routed_experts_base64 != routed:
+                    raise RuntimeError("server returned conflicting routed-expert payloads")
+                routed_experts_base64 = routed
             choices = event.get("choices") or []
             if choices:
                 piece = choices[0].get("text") or ""
@@ -192,6 +404,8 @@ def stream_completion(
         "total_seconds": finished - started,
         "stream_seconds": max(0.0, finished - first_text_at),
         "stream_events": stream_events,
+        "server_request_id": server_request_id,
+        "routed_experts_base64": routed_experts_base64,
     }
 
 
@@ -232,10 +446,38 @@ def main() -> None:
         "--prompt-file",
         help="Use diverse UTF-8 source text instead of the synthetic repeated seed",
     )
+    parser.add_argument(
+        "--capture-routed-experts",
+        action="store_true",
+        help="Ask an instrumented SGLang server to return per-token/layer expert IDs",
+    )
+    parser.add_argument("--routed-experts-start-len", type=int, default=0)
+    parser.add_argument("--routed-expert-layers", type=int, default=48)
+    parser.add_argument("--routed-expert-top-k", type=int, default=8)
+    parser.add_argument("--experts-per-layer", type=int, default=128)
+    parser.add_argument("--expert-parallel-size", type=int, default=4)
+    parser.add_argument(
+        "--expert-routes-output",
+        help="Write exact request/token/layer routes as JSONL or JSONL.GZ",
+    )
+    parser.add_argument(
+        "--expert-summary-output",
+        help="Write expert hotness, co-activation, ownership, and worker fanout JSON",
+    )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     if args.cache_policy == "cold" and args.warmups < 1:
         parser.error("--cache-policy cold requires at least one warmup")
+    if args.capture_routed_experts:
+        if not args.expert_routes_output or not args.expert_summary_output:
+            parser.error(
+                "--capture-routed-experts requires --expert-routes-output and "
+                "--expert-summary-output"
+            )
+        if args.routed_experts_start_len < 0:
+            parser.error("--routed-experts-start-len must be non-negative")
+        if args.experts_per_layer % args.expert_parallel_size:
+            parser.error("--experts-per-layer must be divisible by --expert-parallel-size")
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True)
     source_text = (
@@ -247,6 +489,7 @@ def main() -> None:
     prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
     runs = []
+    route_captures = []
     cache_flush_count = 0
     for index in range(args.warmups + args.repetitions):
         # SGLang can hang if /flush_cache is the first request after startup.
@@ -256,9 +499,16 @@ def main() -> None:
             flush_server_cache(args.endpoint, min(args.timeout, 60.0))
             cache_flush_count += 1
         result = stream_completion(
-            args.endpoint, args.model, prompt, args.max_tokens, args.timeout
+            args.endpoint,
+            args.model,
+            prompt,
+            args.max_tokens,
+            args.timeout,
+            return_routed_experts=args.capture_routed_experts,
+            routed_experts_start_len=args.routed_experts_start_len,
         )
         trace = streaming_trace(result.pop("stream_events"), tokenizer)
+        routed_experts_base64 = result.pop("routed_experts_base64")
         output_ids = tokenizer.encode(result.pop("text"), add_special_tokens=False)
         output_count = int(
             (result.get("usage") or {}).get("completion_tokens") or len(output_ids)
@@ -274,7 +524,7 @@ def main() -> None:
             if decode_seconds > 0 and output_count > 1
             else 0.0
         )
-        runs.append({
+        run = {
             "index": index,
             "measured": index >= args.warmups,
             **result,
@@ -285,7 +535,37 @@ def main() -> None:
                 json.dumps(output_ids, separators=(",", ":")).encode("utf-8")
             ).hexdigest(),
             "output_token_ids": output_ids,
-        })
+        }
+        if args.capture_routed_experts:
+            if not routed_experts_base64:
+                raise RuntimeError(
+                    f"request {index} did not return routed experts; ensure the server "
+                    "was launched with --enable-return-routed-experts"
+                )
+            routes = decode_routed_experts(
+                routed_experts_base64,
+                args.routed_expert_layers,
+                args.routed_expert_top_k,
+                args.experts_per_layer,
+            )
+            run["routed_experts"] = {
+                "encoding": "base64-little-endian-int32",
+                "logical_shape": [
+                    len(routes),
+                    args.routed_expert_layers,
+                    args.routed_expert_top_k,
+                ],
+                "start_token_position": args.routed_experts_start_len,
+                "data": routed_experts_base64,
+            }
+            route_captures.append({
+                "request_index": index,
+                "server_request_id": run.get("server_request_id"),
+                "measured": run["measured"],
+                "start_token_position": args.routed_experts_start_len,
+                "routes": routes,
+            })
+        runs.append(run)
 
     measured = [run for run in runs if run["measured"]]
     report = {
@@ -302,6 +582,22 @@ def main() -> None:
         "repetitions": args.repetitions,
         "cache_policy": args.cache_policy,
         "cache_flush_count": cache_flush_count,
+        "routed_expert_capture": {
+            "enabled": args.capture_routed_experts,
+            "start_token_position": (
+                args.routed_experts_start_len if args.capture_routed_experts else None
+            ),
+            "num_layers": (
+                args.routed_expert_layers if args.capture_routed_experts else None
+            ),
+            "top_k": args.routed_expert_top_k if args.capture_routed_experts else None,
+            "experts_per_layer": (
+                args.experts_per_layer if args.capture_routed_experts else None
+            ),
+            "expert_parallel_size": (
+                args.expert_parallel_size if args.capture_routed_experts else None
+            ),
+        },
         "summary": {
             "ttft_seconds": distribution([run["ttft_seconds"] for run in measured]),
             "total_seconds": distribution([run["total_seconds"] for run in measured]),
@@ -332,6 +628,34 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if args.capture_routed_experts:
+        write_expert_route_jsonl(
+            route_captures,
+            Path(args.expert_routes_output),
+            args.prompt_tokens,
+            args.experts_per_layer,
+            args.expert_parallel_size,
+        )
+        measured_captures = [capture for capture in route_captures if capture["measured"]]
+        expert_summary = summarize_expert_routes(
+            measured_captures,
+            args.routed_expert_layers,
+            args.routed_expert_top_k,
+            args.experts_per_layer,
+            args.expert_parallel_size,
+        )
+        expert_summary.update({
+            "benchmark_output": str(output),
+            "routes_output": args.expert_routes_output,
+            "prompt_sha256": prompt_sha256,
+            "cache_policy": args.cache_policy,
+        })
+        summary_output = Path(args.expert_summary_output)
+        summary_output.parent.mkdir(parents=True, exist_ok=True)
+        summary_output.write_text(
+            json.dumps(expert_summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     print(json.dumps({"output": str(output), **report["summary"]}, indent=2, sort_keys=True))
 
 

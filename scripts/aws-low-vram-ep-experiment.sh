@@ -117,6 +117,45 @@ download_artifacts() {
     --profile "$DAI_PROFILE" --region "$DAI_REGION" --only-show-errors
 }
 
+launch_sglang() {
+  local phase=$1
+  local extra_args=${2:-}
+  local command_ids=()
+  local rank
+  local launch_command
+  echo "Launching $phase TP4/DP4/EP4 server"
+  for rank in $(seq 0 $((DAI_WORKERS - 1))); do
+    launch_command="set -euo pipefail; docker rm -f dai-sglang >/dev/null 2>&1 || true; iface=\$(ip route show default | awk '{print \$5; exit}'); docker run -d --name dai-sglang --gpus all --ipc=host --network host --shm-size 8g -e NCCL_SOCKET_IFNAME=\$iface -e GLOO_SOCKET_IFNAME=\$iface -e NCCL_IB_DISABLE=1 -e NCCL_DEBUG=INFO -v /opt/dai/model:/models/qwen3:ro -v /opt/dai:/opt/dai '$DAI_SGLANG_IMAGE' python3 -m sglang.launch_server --model-path /models/qwen3 --served-model-name qwen3-30b-a3b --host 0.0.0.0 --port 30000 --dist-init-addr '$DAI_HEAD_IP:20000' --nnodes '$DAI_WORKERS' --node-rank '$rank' --tp-size '$DAI_WORKERS' --dp-size '$DAI_WORKERS' --ep-size '$DAI_WORKERS' --enable-dp-attention --init-expert-location trivial --dtype bfloat16 --context-length 2048 --max-running-requests '$DAI_WORKERS' --mem-fraction-static '$DAI_MEM_FRACTION_STATIC' --disable-cuda-graph --disable-custom-all-reduce --random-seed 1234 --watchdog-timeout 900 $extra_args"
+    command_ids+=("$(send_command "${DAI_INSTANCE_IDS[$rank]}" "$launch_command" 600)")
+  done
+  for rank in $(seq 0 $((DAI_WORKERS - 1))); do
+    wait_for_command "${command_ids[$rank]}" "${DAI_INSTANCE_IDS[$rank]}" 70
+  done
+}
+
+wait_for_sglang_health() {
+  local phase=$1
+  local health_command
+  local command_id
+  health_command="set -euo pipefail; for i in \$(seq 1 240); do if curl -fsS http://127.0.0.1:30000/health >/dev/null; then exit 0; fi; if ! docker inspect -f '{{.State.Running}}' dai-sglang 2>/dev/null | grep -q true; then docker logs dai-sglang; exit 1; fi; sleep 5; done; docker logs dai-sglang; exit 1"
+  command_id=$(send_command "${DAI_INSTANCE_IDS[0]}" "$health_command" 1500)
+  echo "Waiting for $phase distributed model initialization ($command_id)"
+  wait_for_command "$command_id" "${DAI_INSTANCE_IDS[0]}" 160
+}
+
+collect_routing_artifacts() {
+  local command_ids=()
+  local rank
+  local command
+  for rank in $(seq 0 $((DAI_WORKERS - 1))); do
+    command="set -euo pipefail; rank=\$(cat /opt/dai/node-rank); docker logs dai-sglang > /opt/dai/results/rank-\${rank}-routing-server.log 2>&1 || true; nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu --format=csv,noheader > /opt/dai/results/rank-\${rank}-routing-gpu.csv; aws s3 cp /opt/dai/results/rank-\${rank}-routing-server.log s3://$DAI_BUCKET/results/ --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/rank-\${rank}-routing-gpu.csv s3://$DAI_BUCKET/results/ --region $DAI_REGION --only-show-errors"
+    command_ids+=("$(send_command "${DAI_INSTANCE_IDS[$rank]}" "$command" 600)")
+  done
+  for rank in $(seq 0 $((DAI_WORKERS - 1))); do
+    wait_for_command "${command_ids[$rank]}" "${DAI_INSTANCE_IDS[$rank]}" 70
+  done
+}
+
 if tofu -chdir="$DAI_TOFU_DIR" state list 2>/dev/null | grep -q .; then
   echo "ERROR: infra/aws-low-vram-ep already has managed resources." >&2
   exit 1
@@ -177,6 +216,9 @@ jq -n --arg run_id "$DAI_RUN_ID" --arg region "$DAI_REGION" --arg az "$DAI_AZ" \
     parallelism:{tp:4,dp:4,ep:4,attention_tp:1},
     model:$model_prefix,dtype:"bfloat16",runtime_image:$image,planned_hourly_compute_usd:($hourly|tonumber),
     workload:{batch:1,input_tokens:1000,output_tokens:256,cache_policy:"cold",max_running_requests:$workers},
+    routing_trace:{separate_instrumented_phase:true,num_layers:48,experts_per_layer:128,
+      experts_per_token:8,expert_parallel_size:4,placement:"trivial-contiguous",
+      warmups:2,measured_requests:10,workload_scope:"fixed-benchmark-prompt"},
     expires_at_utc:$expires}' \
   > "$DAI_RESULT_DIR/manifest.json"
 
@@ -213,20 +255,8 @@ for rank in $(seq 0 $((DAI_WORKERS - 1))); do
   wait_for_command "${DAI_READY_COMMANDS[$rank]}" "${DAI_INSTANCE_IDS[$rank]}" 220
 done
 
-echo "Launching TP4/DP4/EP4: replicated attention, sharded experts"
-DAI_LAUNCH_COMMANDS=()
-for rank in $(seq 0 $((DAI_WORKERS - 1))); do
-  launch_command="set -euo pipefail; docker rm -f dai-sglang >/dev/null 2>&1 || true; iface=\$(ip route show default | awk '{print \$5; exit}'); docker run -d --name dai-sglang --gpus all --ipc=host --network host --shm-size 8g -e NCCL_SOCKET_IFNAME=\$iface -e GLOO_SOCKET_IFNAME=\$iface -e NCCL_IB_DISABLE=1 -e NCCL_DEBUG=INFO -v /opt/dai/model:/models/qwen3:ro -v /opt/dai:/opt/dai '$DAI_SGLANG_IMAGE' python3 -m sglang.launch_server --model-path /models/qwen3 --served-model-name qwen3-30b-a3b --host 0.0.0.0 --port 30000 --dist-init-addr '$DAI_HEAD_IP:20000' --nnodes '$DAI_WORKERS' --node-rank '$rank' --tp-size '$DAI_WORKERS' --dp-size '$DAI_WORKERS' --ep-size '$DAI_WORKERS' --enable-dp-attention --dtype bfloat16 --context-length 2048 --max-running-requests '$DAI_WORKERS' --mem-fraction-static '$DAI_MEM_FRACTION_STATIC' --disable-cuda-graph --disable-custom-all-reduce --random-seed 1234 --watchdog-timeout 900"
-  DAI_LAUNCH_COMMANDS+=("$(send_command "${DAI_INSTANCE_IDS[$rank]}" "$launch_command" 600)")
-done
-for rank in $(seq 0 $((DAI_WORKERS - 1))); do
-  wait_for_command "${DAI_LAUNCH_COMMANDS[$rank]}" "${DAI_INSTANCE_IDS[$rank]}" 70
-done
-
-health_command="set -euo pipefail; for i in \$(seq 1 240); do if curl -fsS http://127.0.0.1:30000/health >/dev/null; then exit 0; fi; if ! docker inspect -f '{{.State.Running}}' dai-sglang 2>/dev/null | grep -q true; then docker logs dai-sglang; exit 1; fi; sleep 5; done; docker logs dai-sglang; exit 1"
-DAI_HEALTH_COMMAND=$(send_command "${DAI_INSTANCE_IDS[0]}" "$health_command" 1500)
-echo "Waiting for distributed BF16 model initialization ($DAI_HEALTH_COMMAND)"
-if ! wait_for_command "$DAI_HEALTH_COMMAND" "${DAI_INSTANCE_IDS[0]}" 160; then
+launch_sglang performance
+if ! wait_for_sglang_health performance; then
   collect_rank_artifacts startup-failed || true
   download_artifacts || true
   echo "ERROR: the four-rank BF16 server did not initialize; retained logs show whether the gate was VRAM or runtime compatibility." >&2
@@ -272,6 +302,55 @@ python3 "$DAI_ROOT/prototype/analyze_low_vram_ep.py" \
   --artifact-dir "$DAI_RESULT_DIR" \
   --output "$DAI_RESULT_DIR/report.json"
 
-jq '{joint_inference_proven,all_ranks_network_active,peak_gpu_memory_mib,distributed,baseline,speed_ratio,output_token_hash_match}' \
+echo "Restarting the same topology for a separate routed-expert trace"
+launch_sglang routing-trace "--enable-return-routed-experts"
+if ! wait_for_sglang_health routing-trace; then
+  collect_routing_artifacts || true
+  download_artifacts || true
+  echo "ERROR: the instrumented routed-expert server did not initialize." >&2
+  exit 1
+fi
+
+routing_command="set -euo pipefail; docker exec dai-sglang python3 /opt/dai/generation_benchmark.py --endpoint http://127.0.0.1:30000 --model qwen3-30b-a3b --tokenizer /models/qwen3 --variant low-vram-ep4-routing-trace --prompt-file /opt/dai/benchmark-prompt.md --prompt-tokens 1000 --max-tokens 256 --warmups 2 --repetitions 10 --cache-policy cold --nonce dai-generation-v2 --capture-routed-experts --routed-experts-start-len 0 --routed-expert-layers 48 --routed-expert-top-k 8 --experts-per-layer 128 --expert-parallel-size 4 --expert-routes-output /opt/dai/results/expert-routes.jsonl.gz --expert-summary-output /opt/dai/results/expert-placement-summary.json --output /opt/dai/results/routing-benchmark.json; curl -fsS http://127.0.0.1:30000/get_server_info > /opt/dai/results/routing-server-info.json; aws s3 cp /opt/dai/results/routing-benchmark.json s3://$DAI_BUCKET/results/routing-benchmark.json --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/expert-routes.jsonl.gz s3://$DAI_BUCKET/results/expert-routes.jsonl.gz --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/expert-placement-summary.json s3://$DAI_BUCKET/results/expert-placement-summary.json --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/routing-server-info.json s3://$DAI_BUCKET/results/routing-server-info.json --region $DAI_REGION --only-show-errors"
+DAI_ROUTING_COMMAND=$(send_command "${DAI_INSTANCE_IDS[0]}" "$routing_command" 7200)
+echo "Capturing exact request/token/layer expert routes ($DAI_ROUTING_COMMAND)"
+if ! wait_for_command "$DAI_ROUTING_COMMAND" "${DAI_INSTANCE_IDS[0]}" 730; then
+  collect_routing_artifacts || true
+  download_artifacts || true
+  echo "ERROR: routed-expert capture failed; retained the instrumented server logs." >&2
+  exit 1
+fi
+
+collect_routing_artifacts
+download_artifacts
+gzip -t "$DAI_RESULT_DIR/expert-routes.jsonl.gz"
+jq -e '.schema == "dai-openai-generation-benchmark.v2" and
+  .routed_expert_capture.enabled == true and
+  .routed_expert_capture.num_layers == 48 and
+  .routed_expert_capture.top_k == 8 and
+  ([.runs[] | select(.measured) | .routed_experts.logical_shape[1:] == [48,8]] | all)' \
+  "$DAI_RESULT_DIR/routing-benchmark.json" >/dev/null
+jq -e '.schema == "dai-expert-placement-summary.v1" and .request_count == 10 and
+  .num_layers == 48 and .top_k == 8 and .experts_per_layer == 128 and
+  .expert_parallel_size == 4 and .token_layer_rows > 0 and
+  (.layers | length) == 48 and .cross_worker_token_layer_fraction >= 0 and
+  .cross_worker_token_layer_fraction <= 1' \
+  "$DAI_RESULT_DIR/expert-placement-summary.json" >/dev/null
+jq -e '.enable_return_routed_experts == true and .init_expert_location == "trivial" and
+  .enable_eplb == false and .ep_num_redundant_experts == 0' \
+  "$DAI_RESULT_DIR/routing-server-info.json" >/dev/null
+
+DAI_REPORT_TMP="$DAI_RESULT_DIR/report.json.tmp"
+jq --slurpfile routes "$DAI_RESULT_DIR/expert-placement-summary.json" \
+  '. + {routing_trace:{artifact:"expert-routes.jsonl.gz",
+    summary_artifact:"expert-placement-summary.json",
+    request_count:$routes[0].request_count,
+    token_layer_rows:$routes[0].token_layer_rows,
+    cross_worker_token_layer_fraction:$routes[0].cross_worker_token_layer_fraction,
+    worker_fanout_token_layer_counts:$routes[0].worker_fanout_token_layer_counts}}' \
+  "$DAI_RESULT_DIR/report.json" > "$DAI_REPORT_TMP"
+mv "$DAI_REPORT_TMP" "$DAI_RESULT_DIR/report.json"
+
+jq '{joint_inference_proven,distributed,baseline,speed_ratio,routing_trace}' \
   "$DAI_RESULT_DIR/report.json"
 echo "Evaluation captured at $DAI_RESULT_DIR"

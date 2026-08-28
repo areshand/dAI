@@ -51,7 +51,7 @@ class RemoteExpert(torch.nn.Module):
         output = bf16_from_bytes(output_bytes, response["rows"], response["hidden_size"])
         restore_started = time.perf_counter_ns()
         restored = output.to(device=hidden.device, dtype=hidden.dtype)
-        torch.mps.synchronize()
+        synchronize_device(hidden.device)
         restore_ms = (time.perf_counter_ns() - restore_started) / 1e6
         self.samples.append({
             "request_id": request_id,
@@ -73,6 +73,15 @@ class RemoteExpert(torch.nn.Module):
 
     def close(self):
         self.connection.close()
+
+
+def synchronize_device(device):
+    """Wait for asynchronous accelerator work without assuming Apple MPS."""
+    device = torch.device(device)
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def selected_routes(router_logits, top_k):

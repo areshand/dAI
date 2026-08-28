@@ -14,9 +14,8 @@ mkdir -p /opt/dai/model /opt/dai/results /opt/dai/hf-cache
 echo '${node_rank}' > /opt/dai/node-rank
 echo '${result_bucket}' > /opt/dai/result-bucket
 echo '${generation_benchmark_gz_b64}' | base64 -d | gzip -dc > /opt/dai/generation_benchmark.py
-echo '${qwen3_placement_patch_gz_b64}' | base64 -d | gzip -dc > /opt/dai/apply_sglang_qwen3_placement_patch.py
 echo '${benchmark_prompt_gz_b64}' | base64 -d | gzip -dc > /opt/dai/benchmark-prompt.md
-chmod 0755 /opt/dai/generation_benchmark.py /opt/dai/apply_sglang_qwen3_placement_patch.py
+chmod 0755 /opt/dai/generation_benchmark.py
 
 cat > /etc/systemd/system/dai-ttl-terminate.service <<'UNIT'
 [Unit]
@@ -50,8 +49,8 @@ test -s /opt/dai/model/model-00016-of-00016.safetensors
 docker pull '${sglang_image}'
 DAI_PATCH_CONTAINER=$(docker create '${sglang_image}')
 docker cp "$DAI_PATCH_CONTAINER:/sgl-workspace/sglang/python/sglang/srt/models/qwen3_moe.py" /opt/dai/qwen3_moe.py
+docker cp "$DAI_PATCH_CONTAINER:/sgl-workspace/sglang/python/sglang/srt/layers/communicator.py" /opt/dai/communicator.py
 docker rm "$DAI_PATCH_CONTAINER"
-python3 /opt/dai/apply_sglang_qwen3_placement_patch.py /opt/dai/qwen3_moe.py > /opt/dai/qwen3-moe-patch-sha256.txt
 docker image inspect '${sglang_image}' > /opt/dai/sglang-image.json
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader > /opt/dai/gpu-contract.csv
 grep -Eq '^NVIDIA L4,' /opt/dai/gpu-contract.csv

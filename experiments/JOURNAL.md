@@ -4,6 +4,7 @@ This journal tracks what was tested, what was learned, and which architectural d
 
 | ID | Date | Status | Question | Decision | Report |
 |---|---|---|---|---|---|
+| EXP-20260828-02 | 2026-08-28 | negative | Can a sparse single-token output combine let inactive EP ranks skip communication and make optimized expert co-location faster? | The mechanism executed and cut full-rank combines from 69.0% to 27.3%, but Python/D2H control plus tiny P2P sends regressed sparse TPS 9.38% versus stock; optimized placement then regressed another 7.29%. Stop combine-only P2P and build GPU-resident source-side sparse dispatch. | [Report](reports/EXP-20260828-02-sparse-ep-combine.md) |
 | EXP-20260828-01 | 2026-08-28 | negative | Can trace-optimized expert co-location reduce worker fanout and speed up four-L4 inference? | Logical locality improved substantially, but full-rank collectives preserved network traffic and optimized TPS regressed 5.08%. Require sparse destination-aware dispatch before more placement tuning. | [Report](reports/EXP-20260828-01-expert-placement-locality.md) |
 | EXP-20260827-01 | 2026-08-27 | negative | Can four GPUs with no more than 24 GiB VRAM jointly serve Qwen3-30B-A3B BF16 with competitive single-request speed? | Capacity passed; ordinary socket-based EP4/TP4 performance failed. Reduce communication rather than add identical nodes. | [Report](reports/EXP-20260827-01-low-vram-ep4.md) |
 | EXP-20260824-01 | 2026-08-24 | validated | Can the target-only model exceed 100 tok/s on one production-fast GPU path? | Yes: 168.246 pooled tok/s with a cold 1,000-token prompt. This supersedes the 59 tok/s diagnostic baseline for performance comparisons. | [Source report](../prototype/TARGET-ONLY-100-TPS-2026-08-24.md) |
@@ -17,13 +18,15 @@ This journal tracks what was tested, what was learned, and which architectural d
 ## Current conclusions
 
 1. The target-only Qwen3-30B-A3B BF16 path already exceeds 100 tok/s on one `g7e.4xlarge`; 59–60 tok/s is a deterministic debugging reference, not the production performance floor.
-2. Placement discovery and route locality matter only when the runtime can exploit them. Trace optimization reduced predicted mean fanout from 3.655 to 2.952 workers per token-layer, but the full-collective backend preserved network bytes and regressed TPS by 5.08%.
-3. Four 24GB-class L4 workers can jointly hold and execute the BF16 model, but EP4/TP4 over ordinary Ethernet falls to 12.66 tok/s and transfers about 81.17 GB across rank interfaces during the evaluation.
+2. Placement discovery and route locality matter only when the runtime can exploit them efficiently. The sparse-combine prototype reduced mean active ranks from 3.675 to 2.939 and made 72.68% of decode-layer combines sparse, but tiny per-layer P2P operations were slower than NCCL's four-rank reduce-scatter; optimized TPS fell to 10.662.
+3. Four 24GB-class L4 workers can jointly hold and execute the BF16 model, but EP4/TP4 over ordinary Ethernet reaches only 12.69 bracketed tok/s with the stock collective. A combine-only sparse protocol regressed TPS by 9.38%; its comparable sparse cells transferred about 71.84 GB, only 1.69% below the single same-scope stock-post cell.
 4. Exact token hashes and task quality are separate gates. Temperature-zero runs can diverge across valid GPU kernel paths, and agentic-coding quality still requires paired task-level evaluation.
 
 ## Next experiments
 
-- [ ] Build a sparse destination-aware expert dispatch gate: uninvolved workers must send zero activation bytes, falling held-out fanout must reduce measured traffic, and outputs must match the unsharded expert reference within tolerance.
+- [x] Test a combine-only sparse gate. It proved inactive ranks can skip the output combine, but failed performance because it retained the full input gather and replaced optimized NCCL collectives with many tiny host-directed P2P messages.
+- [ ] Build a GPU-resident, source-side sparse activation dispatcher: the token owner must route once to selected expert ranks, avoid the full input gather, aggregate results without a host synchronization per layer, and fall back safely for dense/multi-owner batches.
+- [ ] Add a one-layer numerical oracle and deterministic logit probe before another full-model run; require expert-output tolerance and task-quality eligibility separately from token-hash identity.
 - [ ] Only after sparse dispatch passes, replicate or cache hot experts close to requesting token cohorts and measure whether network bytes per decoded token fall materially.
 - [ ] Quantize expert weights enough to test a two-worker topology while preserving the same cold 1,000-input/256-output and task-quality contract.
 - [ ] Compare ordinary socket collectives with an EFA/GPUDirect-capable topology before attributing the EP4 result to expert parallelism in general.

@@ -142,14 +142,15 @@ resource "aws_instance" "worker" {
   placement_group                      = aws_placement_group.experiment.name
   instance_initiated_shutdown_behavior = "terminate"
   user_data_base64 = base64gzip(templatefile("${path.module}/cloud-init.tftpl", {
-    node_rank                   = count.index
-    ttl_minutes                 = var.ttl_minutes
-    aws_region                  = var.aws_region
-    model_bucket                = var.model_bucket
-    model_prefix                = var.model_prefix
-    result_bucket               = aws_s3_bucket.results.id
-    sglang_image                = var.sglang_image
-    generation_benchmark_gz_b64 = base64gzip(file("${local.source_root}/prototype/generation_benchmark.py"))
+    node_rank                    = count.index
+    ttl_minutes                  = var.ttl_minutes
+    aws_region                   = var.aws_region
+    model_bucket                 = var.model_bucket
+    model_prefix                 = var.model_prefix
+    result_bucket                = aws_s3_bucket.results.id
+    sglang_image                 = var.sglang_image
+    generation_benchmark_gz_b64  = base64gzip(file("${local.source_root}/prototype/generation_benchmark.py"))
+    qwen3_placement_patch_gz_b64 = base64gzip(file("${local.source_root}/scripts/apply_sglang_qwen3_placement_patch.py"))
     benchmark_prompt_gz_b64 = base64gzip(substr(
       file("${local.source_root}/moe-distributed-experiment-design.md"), 0, 12000
     ))

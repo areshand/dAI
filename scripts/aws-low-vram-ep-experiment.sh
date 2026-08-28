@@ -14,6 +14,9 @@ DAI_MODEL_PREFIX=${DAI_MODEL_PREFIX:-qwen3-30b-a3b}
 DAI_MODEL_LOCAL=${DAI_MODEL_LOCAL:-$DAI_ROOT/model-cache/qwen3-30b-a3b}
 DAI_MODEL_BUCKET=${DAI_MODEL_BUCKET:-}
 DAI_MEM_FRACTION_STATIC=${DAI_MEM_FRACTION_STATIC:-0.90}
+DAI_EXPERT_PLACEMENT_FILE=${DAI_EXPERT_PLACEMENT_FILE:-}
+DAI_EXPERT_PLACEMENT_REPORT=${DAI_EXPERT_PLACEMENT_REPORT:-}
+DAI_CAPTURE_ROUTING=${DAI_CAPTURE_ROUTING:-1}
 DAI_RUN_ID=${DAI_RUN_ID:-dai-ep4-$(date -u +%Y%m%d-%H%M%S)}
 DAI_RESULT_DIR="$DAI_ROOT/prototype/results/aws-low-vram-ep/$DAI_RUN_ID"
 DAI_TFVARS="$DAI_TOFU_DIR/run.auto.tfvars.json"
@@ -103,7 +106,7 @@ collect_rank_artifacts() {
   local rank
   local command
   for rank in $(seq 0 $((DAI_WORKERS - 1))); do
-    command="set -euo pipefail; rank=\$(cat /opt/dai/node-rank); mkdir -p /opt/dai/results; nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu --format=csv,noheader > /opt/dai/results/rank-\${rank}-${phase}-gpu.csv; ip -s -j link show > /opt/dai/results/rank-\${rank}-${phase}-network.json; docker inspect dai-sglang > /opt/dai/results/rank-\${rank}-${phase}-container.json 2>/dev/null || true; docker logs dai-sglang > /opt/dai/results/rank-\${rank}-server.log 2>&1 || true; aws s3 cp /opt/dai/results/rank-\${rank}-${phase}-gpu.csv s3://$DAI_BUCKET/results/ --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/rank-\${rank}-${phase}-network.json s3://$DAI_BUCKET/results/ --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/rank-\${rank}-${phase}-container.json s3://$DAI_BUCKET/results/ --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/rank-\${rank}-server.log s3://$DAI_BUCKET/results/ --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/gpu-contract.csv s3://$DAI_BUCKET/results/rank-\${rank}-gpu-contract.csv --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/sglang-image.json s3://$DAI_BUCKET/results/rank-\${rank}-sglang-image.json --region $DAI_REGION --only-show-errors"
+    command="set -euo pipefail; rank=\$(cat /opt/dai/node-rank); mkdir -p /opt/dai/results; nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu --format=csv,noheader > /opt/dai/results/rank-\${rank}-${phase}-gpu.csv; ip -s -j link show > /opt/dai/results/rank-\${rank}-${phase}-network.json; docker inspect dai-sglang > /opt/dai/results/rank-\${rank}-${phase}-container.json 2>/dev/null || true; docker logs dai-sglang > /opt/dai/results/rank-\${rank}-${phase}-server.log 2>&1 || true; aws s3 cp /opt/dai/results/rank-\${rank}-${phase}-gpu.csv s3://$DAI_BUCKET/results/ --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/rank-\${rank}-${phase}-network.json s3://$DAI_BUCKET/results/ --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/rank-\${rank}-${phase}-container.json s3://$DAI_BUCKET/results/ --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/rank-\${rank}-${phase}-server.log s3://$DAI_BUCKET/results/ --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/gpu-contract.csv s3://$DAI_BUCKET/results/rank-\${rank}-gpu-contract.csv --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/sglang-image.json s3://$DAI_BUCKET/results/rank-\${rank}-sglang-image.json --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/qwen3-moe-patch-sha256.txt s3://$DAI_BUCKET/results/rank-\${rank}-qwen3-moe-patch-sha256.txt --region $DAI_REGION --only-show-errors"
     command_ids+=("$(send_command "${DAI_INSTANCE_IDS[$rank]}" "$command" 600)")
   done
   for rank in $(seq 0 $((DAI_WORKERS - 1))); do
@@ -120,12 +123,13 @@ download_artifacts() {
 launch_sglang() {
   local phase=$1
   local extra_args=${2:-}
+  local init_expert_location=${3:-trivial}
   local command_ids=()
   local rank
   local launch_command
   echo "Launching $phase TP4/DP4/EP4 server"
   for rank in $(seq 0 $((DAI_WORKERS - 1))); do
-    launch_command="set -euo pipefail; docker rm -f dai-sglang >/dev/null 2>&1 || true; iface=\$(ip route show default | awk '{print \$5; exit}'); docker run -d --name dai-sglang --gpus all --ipc=host --network host --shm-size 8g -e NCCL_SOCKET_IFNAME=\$iface -e GLOO_SOCKET_IFNAME=\$iface -e NCCL_IB_DISABLE=1 -e NCCL_DEBUG=INFO -v /opt/dai/model:/models/qwen3:ro -v /opt/dai:/opt/dai '$DAI_SGLANG_IMAGE' python3 -m sglang.launch_server --model-path /models/qwen3 --served-model-name qwen3-30b-a3b --host 0.0.0.0 --port 30000 --dist-init-addr '$DAI_HEAD_IP:20000' --nnodes '$DAI_WORKERS' --node-rank '$rank' --tp-size '$DAI_WORKERS' --dp-size '$DAI_WORKERS' --ep-size '$DAI_WORKERS' --enable-dp-attention --init-expert-location trivial --dtype bfloat16 --context-length 2048 --max-running-requests '$DAI_WORKERS' --mem-fraction-static '$DAI_MEM_FRACTION_STATIC' --disable-cuda-graph --disable-custom-all-reduce --random-seed 1234 --watchdog-timeout 900 $extra_args"
+    launch_command="set -euo pipefail; docker rm -f dai-sglang >/dev/null 2>&1 || true; iface=\$(ip route show default | awk '{print \$5; exit}'); docker run -d --name dai-sglang --gpus all --ipc=host --network host --shm-size 8g -e NCCL_SOCKET_IFNAME=\$iface -e GLOO_SOCKET_IFNAME=\$iface -e NCCL_IB_DISABLE=1 -e NCCL_DEBUG=INFO -v /opt/dai/model:/models/qwen3:ro -v /opt/dai:/opt/dai -v /opt/dai/qwen3_moe.py:/sgl-workspace/sglang/python/sglang/srt/models/qwen3_moe.py:ro '$DAI_SGLANG_IMAGE' python3 -m sglang.launch_server --model-path /models/qwen3 --served-model-name qwen3-30b-a3b --host 0.0.0.0 --port 30000 --dist-init-addr '$DAI_HEAD_IP:20000' --nnodes '$DAI_WORKERS' --node-rank '$rank' --tp-size '$DAI_WORKERS' --dp-size '$DAI_WORKERS' --ep-size '$DAI_WORKERS' --enable-dp-attention --init-expert-location '$init_expert_location' --dtype bfloat16 --context-length 2048 --max-running-requests '$DAI_WORKERS' --mem-fraction-static '$DAI_MEM_FRACTION_STATIC' --disable-cuda-graph --disable-custom-all-reduce --random-seed 1234 --watchdog-timeout 900 $extra_args"
     command_ids+=("$(send_command "${DAI_INSTANCE_IDS[$rank]}" "$launch_command" 600)")
   done
   for rank in $(seq 0 $((DAI_WORKERS - 1))); do
@@ -163,6 +167,16 @@ fi
 if [[ ! -s "$DAI_MODEL_LOCAL/model.safetensors.index.json" ]]; then
   echo "ERROR: local pinned model is missing at $DAI_MODEL_LOCAL." >&2
   exit 1
+fi
+if [[ "$DAI_CAPTURE_ROUTING" != "0" && "$DAI_CAPTURE_ROUTING" != "1" ]]; then
+  echo "ERROR: DAI_CAPTURE_ROUTING must be 0 or 1." >&2
+  exit 1
+fi
+if [[ -n "$DAI_EXPERT_PLACEMENT_FILE" ]]; then
+  test -s "$DAI_EXPERT_PLACEMENT_FILE"
+  test -s "$DAI_EXPERT_PLACEMENT_REPORT"
+  jq -e '.physical_to_logical_map | length == 48 and
+    all(.[]; length == 128 and (sort == [range(0;128)]))' "$DAI_EXPERT_PLACEMENT_FILE" >/dev/null
 fi
 
 DAI_ACCOUNT=$(aws sts get-caller-identity --profile "$DAI_PROFILE" --query Account --output text)
@@ -208,6 +222,7 @@ jq -n --arg profile "$DAI_PROFILE" --arg region "$DAI_REGION" --arg run_id "$DAI
 jq -n --arg run_id "$DAI_RUN_ID" --arg region "$DAI_REGION" --arg az "$DAI_AZ" \
   --arg instance_type "$DAI_INSTANCE_TYPE" --arg image "$DAI_SGLANG_IMAGE" \
   --arg model_prefix "$DAI_MODEL_PREFIX" --arg expires "$DAI_EXPIRES_AT" \
+  --arg placement_file "$DAI_EXPERT_PLACEMENT_FILE" --argjson capture_routing "$DAI_CAPTURE_ROUTING" \
   --argjson workers "$DAI_WORKERS" --argjson gpu_vram_mib 22888 --argjson gpu_vram_limit_mib 24576 \
   --arg hourly "$DAI_TOTAL_HOURLY_USD" \
   '{schema:"dai-low-vram-ep-manifest.v1",run_id:$run_id,region:$region,availability_zone:$az,
@@ -216,7 +231,11 @@ jq -n --arg run_id "$DAI_RUN_ID" --arg region "$DAI_REGION" --arg az "$DAI_AZ" \
     parallelism:{tp:4,dp:4,ep:4,attention_tp:1},
     model:$model_prefix,dtype:"bfloat16",runtime_image:$image,planned_hourly_compute_usd:($hourly|tonumber),
     workload:{batch:1,input_tokens:1000,output_tokens:256,cache_policy:"cold",max_running_requests:$workers},
-    routing_trace:{separate_instrumented_phase:true,num_layers:48,experts_per_layer:128,
+    runtime_patch:{name:"qwen3-forward-normal-logical-to-physical-dispatch",
+      pinned_source_sha256:"b18eb188c594c41ff58debe6df72cf852975b0504b5ae0513ccb4be75fea1bc2"},
+    placement_comparison:{enabled:($placement_file != ""),
+      execution_order:["trivial-pre","optimized","trivial-post"]},
+    routing_trace:{separate_instrumented_phase:($capture_routing == 1),num_layers:48,experts_per_layer:128,
       experts_per_token:8,expert_parallel_size:4,placement:"trivial-contiguous",
       warmups:2,measured_requests:10,workload_scope:"fixed-benchmark-prompt"},
     expires_at_utc:$expires}' \
@@ -255,6 +274,21 @@ for rank in $(seq 0 $((DAI_WORKERS - 1))); do
   wait_for_command "${DAI_READY_COMMANDS[$rank]}" "${DAI_INSTANCE_IDS[$rank]}" 220
 done
 
+if [[ -n "$DAI_EXPERT_PLACEMENT_FILE" ]]; then
+  cp "$DAI_EXPERT_PLACEMENT_FILE" "$DAI_RESULT_DIR/optimized-expert-placement.json"
+  cp "$DAI_EXPERT_PLACEMENT_REPORT" "$DAI_RESULT_DIR/expert-placement-optimization.json"
+  aws s3 cp "$DAI_EXPERT_PLACEMENT_FILE" "s3://$DAI_BUCKET/control/optimized-expert-placement.json" \
+    --profile "$DAI_PROFILE" --region "$DAI_REGION" --only-show-errors
+  DAI_PLACEMENT_COMMANDS=()
+  for rank in $(seq 0 $((DAI_WORKERS - 1))); do
+    DAI_PLACEMENT_COMMANDS+=("$(send_command "${DAI_INSTANCE_IDS[$rank]}" \
+      "aws s3 cp s3://$DAI_BUCKET/control/optimized-expert-placement.json /opt/dai/optimized-expert-placement.json --region $DAI_REGION --only-show-errors" 600)")
+  done
+  for rank in $(seq 0 $((DAI_WORKERS - 1))); do
+    wait_for_command "${DAI_PLACEMENT_COMMANDS[$rank]}" "${DAI_INSTANCE_IDS[$rank]}" 70
+  done
+fi
+
 launch_sglang performance
 if ! wait_for_sglang_health performance; then
   collect_rank_artifacts startup-failed || true
@@ -280,7 +314,9 @@ download_artifacts
 
 jq -e '.schema == "dai-openai-generation-benchmark.v2" and .prompt_tokens == 1000 and
   .max_tokens == 256 and .repetitions == 10 and .cache_policy == "cold" and
-  .cache_flush_count == 11 and ([.runs[] | select(.measured) | .output_tokens == 256] | all)' \
+  .cache_flush_count == 11 and ([.runs[] | select(.measured) |
+    .output_tokens == 256 and (.output_token_ids | length) == .output_tokens and
+    (.output_token_ids | unique | length) > 1] | all)' \
   "$DAI_RESULT_DIR/benchmark.json" >/dev/null
 for rank in $(seq 0 $((DAI_WORKERS - 1))); do
   grep -Eq '^NVIDIA L4,' "$DAI_RESULT_DIR/rank-${rank}-gpu-contract.csv"
@@ -301,6 +337,75 @@ python3 "$DAI_ROOT/prototype/analyze_low_vram_ep.py" \
   --baseline "$DAI_RESULT_DIR/single-gpu-baseline.json" \
   --artifact-dir "$DAI_RESULT_DIR" \
   --output "$DAI_RESULT_DIR/report.json"
+
+if [[ -n "$DAI_EXPERT_PLACEMENT_FILE" ]]; then
+  echo "Restarting the topology with the optimized expert placement"
+  launch_sglang optimized "" /opt/dai/optimized-expert-placement.json
+  if ! wait_for_sglang_health optimized; then
+    collect_rank_artifacts optimized-startup-failed || true
+    download_artifacts || true
+    echo "ERROR: optimized expert placement did not initialize." >&2
+    exit 1
+  fi
+  collect_rank_artifacts optimized-before
+  optimized_smoke_command="set -euo pipefail; docker exec dai-sglang python3 /opt/dai/generation_benchmark.py --endpoint http://127.0.0.1:30000 --model qwen3-30b-a3b --tokenizer /models/qwen3 --variant low-vram-ep4-optimized-placement-smoke --prompt-file /opt/dai/benchmark-prompt.md --prompt-tokens 1000 --max-tokens 32 --warmups 1 --repetitions 1 --cache-policy cold --nonce dai-generation-v2 --output /opt/dai/results/optimized-smoke.json; aws s3 cp /opt/dai/results/optimized-smoke.json s3://$DAI_BUCKET/results/optimized-smoke.json --region $DAI_REGION --only-show-errors"
+  DAI_OPTIMIZED_SMOKE_COMMAND=$(send_command "${DAI_INSTANCE_IDS[0]}" "$optimized_smoke_command" 1800)
+  echo "Running the optimized-placement correctness smoke ($DAI_OPTIMIZED_SMOKE_COMMAND)"
+  wait_for_command "$DAI_OPTIMIZED_SMOKE_COMMAND" "${DAI_INSTANCE_IDS[0]}" 190
+  download_artifacts
+  jq -e '[.runs[] | select(.measured) | .output_tokens == 32 and
+    (.output_token_ids | length) == .output_tokens and
+    (.output_token_ids | unique | length) > 1] | all' \
+    "$DAI_RESULT_DIR/optimized-smoke.json" >/dev/null
+  optimized_command="set -euo pipefail; docker exec dai-sglang python3 /opt/dai/generation_benchmark.py --endpoint http://127.0.0.1:30000 --model qwen3-30b-a3b --tokenizer /models/qwen3 --variant low-vram-ep4-optimized-placement --prompt-file /opt/dai/benchmark-prompt.md --prompt-tokens 1000 --max-tokens 256 --warmups 2 --repetitions 10 --cache-policy cold --nonce dai-generation-v2 --output /opt/dai/results/optimized-benchmark.json; curl -fsS http://127.0.0.1:30000/get_server_info > /opt/dai/results/optimized-server-info.json; aws s3 cp /opt/dai/results/optimized-benchmark.json s3://$DAI_BUCKET/results/optimized-benchmark.json --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/optimized-server-info.json s3://$DAI_BUCKET/results/optimized-server-info.json --region $DAI_REGION --only-show-errors"
+  DAI_OPTIMIZED_COMMAND=$(send_command "${DAI_INSTANCE_IDS[0]}" "$optimized_command" 7200)
+  echo "Running the optimized-placement evaluation ($DAI_OPTIMIZED_COMMAND)"
+  wait_for_command "$DAI_OPTIMIZED_COMMAND" "${DAI_INSTANCE_IDS[0]}" 730
+  collect_rank_artifacts optimized-after
+  download_artifacts
+  jq -e '[.runs[] | select(.measured) | .output_tokens == 256 and
+    (.output_token_ids | length) == .output_tokens and
+    (.output_token_ids | unique | length) > 1] | all' \
+    "$DAI_RESULT_DIR/optimized-benchmark.json" >/dev/null
+
+  echo "Restarting trivial placement for the post-baseline drift check"
+  launch_sglang baseline-post
+  if ! wait_for_sglang_health baseline-post; then
+    collect_rank_artifacts baseline-post-startup-failed || true
+    download_artifacts || true
+    echo "ERROR: post-baseline server did not initialize." >&2
+    exit 1
+  fi
+  collect_rank_artifacts baseline-post-before
+  baseline_post_command="set -euo pipefail; docker exec dai-sglang python3 /opt/dai/generation_benchmark.py --endpoint http://127.0.0.1:30000 --model qwen3-30b-a3b --tokenizer /models/qwen3 --variant low-vram-ep4-bf16-post --prompt-file /opt/dai/benchmark-prompt.md --prompt-tokens 1000 --max-tokens 256 --warmups 2 --repetitions 10 --cache-policy cold --nonce dai-generation-v2 --output /opt/dai/results/baseline-post-benchmark.json; curl -fsS http://127.0.0.1:30000/get_server_info > /opt/dai/results/baseline-post-server-info.json; aws s3 cp /opt/dai/results/baseline-post-benchmark.json s3://$DAI_BUCKET/results/baseline-post-benchmark.json --region $DAI_REGION --only-show-errors; aws s3 cp /opt/dai/results/baseline-post-server-info.json s3://$DAI_BUCKET/results/baseline-post-server-info.json --region $DAI_REGION --only-show-errors"
+  DAI_BASELINE_POST_COMMAND=$(send_command "${DAI_INSTANCE_IDS[0]}" "$baseline_post_command" 7200)
+  echo "Running the post-baseline evaluation ($DAI_BASELINE_POST_COMMAND)"
+  wait_for_command "$DAI_BASELINE_POST_COMMAND" "${DAI_INSTANCE_IDS[0]}" 730
+  collect_rank_artifacts baseline-post-after
+  download_artifacts
+
+  jq -e '.init_expert_location == "/opt/dai/optimized-expert-placement.json" and
+    .ep_dispatch_algorithm == "static" and .enable_eplb == false and
+    .ep_num_redundant_experts == 0 and .moe_a2a_backend == "none"' \
+    "$DAI_RESULT_DIR/optimized-server-info.json" >/dev/null
+  jq -e '.init_expert_location == "trivial" and .enable_eplb == false and
+    .ep_num_redundant_experts == 0 and .moe_a2a_backend == "none"' \
+    "$DAI_RESULT_DIR/baseline-post-server-info.json" >/dev/null
+  python3 "$DAI_ROOT/prototype/compare_expert_placement.py" \
+    --trivial-pre "$DAI_RESULT_DIR/benchmark.json" \
+    --optimized "$DAI_RESULT_DIR/optimized-benchmark.json" \
+    --trivial-post "$DAI_RESULT_DIR/baseline-post-benchmark.json" \
+    --optimization-report "$DAI_RESULT_DIR/expert-placement-optimization.json" \
+    --output "$DAI_RESULT_DIR/expert-placement-comparison.json"
+  jq '{trivial_pre,optimized,trivial_post,baseline_drift_fraction,
+    optimized_speedup_vs_bracketed_trivial,predicted_routing}' \
+    "$DAI_RESULT_DIR/expert-placement-comparison.json"
+fi
+
+if [[ "$DAI_CAPTURE_ROUTING" == "0" ]]; then
+  echo "Placement comparison captured at $DAI_RESULT_DIR"
+  exit 0
+fi
 
 echo "Restarting the same topology for a separate routed-expert trace"
 launch_sglang routing-trace "--enable-return-routed-experts"

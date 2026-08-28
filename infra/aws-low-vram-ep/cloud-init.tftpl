@@ -47,6 +47,10 @@ test -s /opt/dai/model/model.safetensors.index.json
 test -s /opt/dai/model/model-00016-of-00016.safetensors
 
 docker pull '${sglang_image}'
+DAI_PATCH_CONTAINER=$(docker create '${sglang_image}')
+docker cp "$DAI_PATCH_CONTAINER:/sgl-workspace/sglang/python/sglang/srt/models/qwen3_moe.py" /opt/dai/qwen3_moe.py
+docker cp "$DAI_PATCH_CONTAINER:/sgl-workspace/sglang/python/sglang/srt/layers/communicator.py" /opt/dai/communicator.py
+docker rm "$DAI_PATCH_CONTAINER"
 docker image inspect '${sglang_image}' > /opt/dai/sglang-image.json
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader > /opt/dai/gpu-contract.csv
 grep -Eq '^NVIDIA L4,' /opt/dai/gpu-contract.csv

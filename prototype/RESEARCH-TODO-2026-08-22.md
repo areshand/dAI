@@ -125,6 +125,12 @@ memory/compute can beat the best local CPU/NVMe offload reference.
 
 ## Newly discovered issues and directions
 
+- [x] Sparse-combine SGLang prototype: a dedicated NCCL P2P communicator let inactive EP ranks skip single-token output combines without deadlock. Ordinary placement used the sparse branch for 30.99% of eligible layer calls; optimized placement used it for 72.68%.
+- [x] Sparse-combine performance gate failed: bracketed sparse/trivial was 11.500 tok/s versus 12.690 stock (-9.38%), and optimized placement fell to 10.662 tok/s (-7.29% versus sparse/trivial) despite 3.08% lower measured traffic.
+- [x] Root-cause direction: the combine-only patch performs a GPU-to-host route sync at every MoE layer, emits many tiny P2P messages, and retains the full-rank input gather. More locality therefore selected the slower P2P branch more often.
+- [ ] Replace combine-only P2P with a GPU-resident source-side sparse activation dispatcher. Prove it first in a one-layer numerical/performance oracle before another paid full-model run.
+- [ ] Add a density-aware collective fallback, multi-owner packing, deterministic logit/tensor probes, and paired agentic-coding quality before calling the sparse path lossless or quality eligible.
+
 - [x] LAN discovery issue: bare `x` does not resolve, but `x.local` resolves via
   mDNS. Inventory: Intel x86_64 Mac, macOS 12.7.6, 16 GiB RAM, Python 3.9.6.
 - [x] AWS access issue: renewed the expired `mi:scratchpad` SSO token; verified
